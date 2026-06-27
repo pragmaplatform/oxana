@@ -1083,7 +1083,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "oxanus"
-version = "1.1.1"
+version = "2.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "oxanus-macros"
-version = "1.0.1"
+version = "2.0.0"
 dependencies = [
  "darling",
  "heck",
@@ -1124,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "oxanus-web"
-version = "1.0.1"
+version = "2.0.0"
 dependencies = [
  "askama",
  "askama_web",

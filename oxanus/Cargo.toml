@@ -1,10 +1,12 @@
 [package]
 name = "oxanus"
-version = "1.1.1"
+version = "2.0.0"
 edition = "2024"
 license = "MIT"
-description = "A simple & fast job queue system."
-repository = "https://github.com/pragmaplatform/oxanus"
+description = "DEPRECATED: renamed to oxana. Use oxana 2.x instead."
+homepage = "https://github.com/pragmaplatform/oxana"
+repository = "https://github.com/pragmaplatform/oxana"
+documentation = "https://docs.rs/oxana/latest/oxana/"
 keywords = ["job", "scheduler", "worker", "cron"]
 categories = ["asynchronous", "web-programming", "concurrency"]
 exclude = [".*", "logo.jpg"]

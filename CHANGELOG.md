@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.0]
+
+### Deprecated
+
+- Deprecate the `oxanus`, `oxanus-macros`, and `oxanus-web` crates. The project has been renamed to `oxana`; migrate to `oxana = "2"` and `oxana-web = "2"`.
+- Add Cargo build warnings so existing `oxanus` users see the migration notice during builds without changing runtime behavior.
+
 ## [1.1.1]
 
 ### Fixed

@@ -1,10 +1,12 @@
 [package]
 name = "oxanus-web"
-version = "1.0.1"
+version = "2.0.0"
 edition = "2024"
 license = "MIT"
-description = "Web UI for Oxanus job queue system."
-repository = "https://github.com/pragmaplatform/oxanus"
+description = "DEPRECATED: renamed to oxana-web. Use oxana-web 2.x instead."
+homepage = "https://github.com/pragmaplatform/oxana"
+repository = "https://github.com/pragmaplatform/oxana"
+documentation = "https://docs.rs/oxana-web/latest/oxana_web/"
 keywords = ["job", "scheduler", "worker", "web"]
 categories = ["asynchronous", "web-programming"]
 exclude = [".*", "logo.jpg"]

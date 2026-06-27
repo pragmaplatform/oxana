@@ -2,7 +2,7 @@ name: Test
 
 on:
   push:
-    branches: [main]
+    branches: [oxanus]
   pull_request:
 
 env:
@@ -50,7 +50,7 @@ jobs:
         run: cargo bench
 
       - name: Publish
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/oxanus'
         run: |
           cargo publish -p oxanus-macros || true
           cargo publish -p oxanus || true

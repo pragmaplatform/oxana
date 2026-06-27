@@ -1,10 +1,12 @@
 [package]
 name = "oxanus-macros"
-version = "1.0.1"
+version = "2.0.0"
 edition = "2024"
 license = "MIT"
-description = "Macros for Oxanus."
-repository = "https://github.com/pragmaplatform/oxanus"
+description = "DEPRECATED: renamed to oxana-macros. Use oxana-macros 2.x instead."
+homepage = "https://github.com/pragmaplatform/oxana"
+repository = "https://github.com/pragmaplatform/oxana"
+documentation = "https://docs.rs/oxana-macros/latest/oxana_macros/"
 
 [lib]
 proc-macro = true
