@@ -38,48 +38,7 @@ pub async fn run<DT>(
 where
     DT: Send + Sync + Clone + 'static,
 {
-    if !worker.should_resume() {
-        envelope.meta.state = None;
-    }
-    config.storage.internal.set_started_at(envelope).await?;
-    let policy = execution_policy(&worker, 0, envelope);
-    let names = ExecutionNames {
-        job: worker.job_name(),
-        worker: worker.worker_name(),
-    };
-
-    tracing::info!(
-        job_id = envelope.id,
-        queue = envelope.queue,
-        job = names.job,
-        worker = names.worker,
-        latency_ms = envelope.meta.latency_millis(),
-        "Job started"
-    );
-    let start = std::time::Instant::now();
-    let job_contexts = vec![job_context(&config.storage, envelope)];
-
-    let result = run_process(worker, job_contexts, envelope).await;
-
-    let duration = start.elapsed();
-    let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-    let is_err = !matches!(result, ExecutionResult::NotPanic(Ok(_)));
-    tracing::info!(
-        job_id = envelope.id,
-        queue = envelope.queue,
-        job = names.job,
-        worker = names.worker,
-        success = !is_err,
-        duration = duration_ms,
-        retries = envelope.meta.retries,
-        "Job finished"
-    );
-
-    let result = finish_job_result(config.as_ref(), result, envelope, &policy, names).await;
-    Ok(ExecutionOutcome {
-        result,
-        duration_ms,
-    })
+    run_batch(config, worker, std::slice::from_mut(envelope)).await
 }
 
 pub async fn run_batch<DT>(
@@ -132,13 +91,24 @@ where
         worker: worker.worker_name(),
     };
 
-    tracing::info!(
-        batch_size = envelopes.len(),
-        queue = queue,
-        job = names.job,
-        worker = names.worker,
-        "Job batch started"
-    );
+    if envelopes.len() == 1 {
+        tracing::info!(
+            job_id = first_envelope.id,
+            queue = queue,
+            job = names.job,
+            worker = names.worker,
+            latency_ms = first_envelope.meta.latency_millis(),
+            "Job started"
+        );
+    } else {
+        tracing::info!(
+            batch_size = envelopes.len(),
+            queue = queue,
+            job = names.job,
+            worker = names.worker,
+            "Job batch started"
+        );
+    }
     let start = std::time::Instant::now();
     let job_contexts = job_contexts(&config.storage, envelopes);
 
@@ -147,15 +117,28 @@ where
     let duration = start.elapsed();
     let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
     let is_err = !matches!(result, ExecutionResult::NotPanic(Ok(_)));
-    tracing::info!(
-        batch_size = envelopes.len(),
-        queue = queue,
-        job = names.job,
-        worker = names.worker,
-        success = !is_err,
-        duration = duration_ms,
-        "Job batch finished"
-    );
+    if envelopes.len() == 1 {
+        tracing::info!(
+            job_id = first_envelope.id,
+            queue = queue,
+            job = names.job,
+            worker = names.worker,
+            success = !is_err,
+            duration = duration_ms,
+            retries = first_envelope.meta.retries,
+            "Job finished"
+        );
+    } else {
+        tracing::info!(
+            batch_size = envelopes.len(),
+            queue = queue,
+            job = names.job,
+            worker = names.worker,
+            success = !is_err,
+            duration = duration_ms,
+            "Job batch finished"
+        );
+    }
 
     let result = finish_batch_result(config.as_ref(), result, envelopes, &policies, names).await;
     Ok(ExecutionOutcome {
@@ -204,66 +187,6 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-async fn finish_job_result<DT>(
-    config: &Runtime<DT>,
-    result: ExecutionResult,
-    envelope: &JobEnvelope,
-    policy: &JobExecutionPolicy,
-    names: ExecutionNames,
-) -> Result<(), ExecutionError>
-where
-    DT: Send + Sync + Clone + 'static,
-{
-    match result {
-        ExecutionResult::NotPanic(Ok(())) => {
-            if let Err(e) = config.storage.internal.finish_with_success(envelope).await {
-                tracing::error!("Failed to finish job: {}", e);
-            }
-            Ok(())
-        }
-        ExecutionResult::NotPanic(Err(e)) => {
-            let retry_delay = retry_delay(config, e.as_ref(), envelope, policy);
-
-            #[cfg(feature = "sentry")]
-            sentry_core::capture_error(e.as_ref());
-
-            tracing::error!(
-                job_id = envelope.id,
-                queue = envelope.queue,
-                job = names.job,
-                worker = names.worker,
-                "Job failed"
-            );
-
-            handle_err(
-                config,
-                &e.to_string(),
-                envelope,
-                retry_delay,
-                policy.max_retries,
-            )
-            .await;
-
-            Err(ExecutionError::NotPanic)
-        }
-        ExecutionResult::Panic(panic_msg) => {
-            #[cfg(feature = "sentry")]
-            sentry_core::capture_message(&panic_msg, sentry_core::Level::Error);
-
-            handle_err(
-                config,
-                &panic_msg,
-                envelope,
-                policy.retry_delay,
-                policy.max_retries,
-            )
-            .await;
-
-            Err(ExecutionError::Panic())
-        }
-    }
-}
-
 async fn finish_batch_result<DT>(
     config: &Runtime<DT>,
     result: ExecutionResult,
@@ -291,13 +214,23 @@ where
             sentry_core::capture_error(e.as_ref());
 
             if let Some(envelope) = envelopes.first() {
-                tracing::error!(
-                    batch_size = envelopes.len(),
-                    queue = envelope.queue,
-                    job = names.job,
-                    worker = names.worker,
-                    "Job batch failed"
-                );
+                if envelopes.len() == 1 {
+                    tracing::error!(
+                        job_id = envelope.id,
+                        queue = envelope.queue,
+                        job = names.job,
+                        worker = names.worker,
+                        "Job failed"
+                    );
+                } else {
+                    tracing::error!(
+                        batch_size = envelopes.len(),
+                        queue = envelope.queue,
+                        job = names.job,
+                        worker = names.worker,
+                        "Job batch failed"
+                    );
+                }
             }
 
             let err_msg = e.to_string();
