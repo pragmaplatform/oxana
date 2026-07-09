@@ -648,12 +648,6 @@ impl StorageInternal {
         self.update_job(&envelope).await
     }
 
-    pub async fn set_started_at(&self, envelope: &mut JobEnvelope) -> Result<(), OxanaError> {
-        envelope.meta.started_at = Some(chrono::Utc::now().timestamp_micros());
-        self.update_job(envelope).await?;
-        Ok(())
-    }
-
     pub async fn set_started_at_batch(
         &self,
         envelopes: &mut [JobEnvelope],
@@ -3430,33 +3424,6 @@ mod tests {
         assert_eq!(retried, 2);
         assert_eq!(storage.retries_count().await?, 0);
         assert_eq!(storage.enqueued_count(&queue).await?, 2);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_set_started_at() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
-        let queue = random_string();
-
-        let mut envelope = JobEnvelope::new(queue.clone(), TestJob {})?;
-        assert!(envelope.meta.started_at.is_none());
-
-        storage.enqueue(envelope.clone()).await?;
-
-        let before = chrono::Utc::now().timestamp_micros();
-        storage.set_started_at(&mut envelope).await?;
-        let after = chrono::Utc::now().timestamp_micros();
-
-        let started_at = envelope.meta.started_at.expect("started_at should be set");
-        assert!(started_at >= before);
-        assert!(started_at <= after);
-
-        let persisted = storage
-            .get_job(&envelope.id)
-            .await?
-            .expect("job should exist");
-        assert_eq!(persisted.meta.started_at, Some(started_at));
 
         Ok(())
     }
