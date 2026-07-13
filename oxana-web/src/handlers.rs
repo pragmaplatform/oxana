@@ -16,6 +16,9 @@ use crate::templates::{
     QueueRuntimeConfigView, QueuesTemplate,
 };
 
+const DEFAULT_QUEUE_SORT: &str = "enqueued";
+const DEFAULT_QUEUE_SORT_DIRECTION: &str = "desc";
+
 pub(crate) async fn dashboard(
     Extension(state): Extension<OxanaWebState>,
 ) -> Result<DashboardTemplate, OxanaWebError> {
@@ -53,11 +56,7 @@ pub(crate) async fn queues_list(
     let query = oxana::JobMetricsQuery::new(params.minutes.unwrap_or(0));
     let queue_lengths = state.storage.queue_length_metrics(query).await?;
 
-    let sort = params.sort.as_deref().unwrap_or("key");
-    let dir = params.dir.as_deref().unwrap_or("asc");
-    let desc = dir == "desc";
-
-    sort_queues(&mut stats.queues, &queue_configs, sort, desc);
+    let (sort, dir) = sort_queues_for_params(&mut stats.queues, &queue_configs, &params);
 
     Ok(QueuesTemplate {
         base_path: state.base_path,
@@ -899,7 +898,7 @@ fn sort_queues(
     desc: bool,
 ) {
     queues.sort_by(|a, b| {
-        if sort == "eta" {
+        let cmp = if sort == "eta" {
             compare_eta(a.rate.eta_s, b.rate.eta_s, desc)
         } else {
             let cmp = match sort {
@@ -933,8 +932,27 @@ fn sort_queues(
                 _ => a.key.cmp(&b.key),
             };
             if desc { cmp.reverse() } else { cmp }
-        }
+        };
+        cmp.then_with(|| a.key.cmp(&b.key))
     });
+}
+
+fn sort_queues_for_params<'params>(
+    queues: &mut [oxana::QueueStats],
+    queue_configs: &HashMap<String, QueueRuntimeConfigView>,
+    params: &'params QueuesParams,
+) -> (&'params str, &'params str) {
+    let sort = params.sort.as_deref().unwrap_or(DEFAULT_QUEUE_SORT);
+    let default_dir = if params.sort.is_none() {
+        DEFAULT_QUEUE_SORT_DIRECTION
+    } else {
+        "asc"
+    };
+    let dir = params.dir.as_deref().unwrap_or(default_dir);
+
+    sort_queues(queues, queue_configs, sort, dir == "desc");
+
+    (sort, dir)
 }
 
 fn queue_state_order(queue_configs: &HashMap<String, QueueRuntimeConfigView>, key: &str) -> u8 {
@@ -1243,6 +1261,50 @@ mod tests {
     use std::io::Error as WorkerError;
 
     const CRON_WORKER_NAME: &str = "test::CleanupCronWorker";
+
+    #[test]
+    fn queues_default_sort_is_enqueued_descending() {
+        let mut lightly_loaded = queue_with_eta("lightly-loaded", None);
+        lightly_loaded.enqueued = 2;
+        let mut beta = queue_with_eta("beta", None);
+        beta.enqueued = 20;
+        let mut alpha = queue_with_eta("alpha", None);
+        alpha.enqueued = 20;
+        let mut queues = vec![lightly_loaded, beta, alpha];
+        let params = super::QueuesParams {
+            sort: None,
+            dir: None,
+            minutes: None,
+        };
+
+        let (sort, dir) = super::sort_queues_for_params(&mut queues, &HashMap::new(), &params);
+
+        let keys = queues
+            .iter()
+            .map(|queue| queue.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!((sort, dir), ("enqueued", "desc"));
+        assert_eq!(keys, vec!["alpha", "beta", "lightly-loaded"]);
+    }
+
+    #[test]
+    fn explicit_queue_sort_without_direction_remains_ascending() {
+        let mut queues = vec![queue_with_eta("beta", None), queue_with_eta("alpha", None)];
+        let params = super::QueuesParams {
+            sort: Some("key".to_string()),
+            dir: None,
+            minutes: None,
+        };
+
+        let (sort, dir) = super::sort_queues_for_params(&mut queues, &HashMap::new(), &params);
+
+        let keys = queues
+            .iter()
+            .map(|queue| queue.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!((sort, dir), ("key", "asc"));
+        assert_eq!(keys, vec!["alpha", "beta"]);
+    }
 
     #[derive(Serialize)]
     struct StaticQueue;
