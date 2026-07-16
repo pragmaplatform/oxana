@@ -12,17 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     OxanaError,
     job_envelope::{JobConflictStrategy, JobEnvelope, JobId},
-    metrics::{
-        HISTOGRAM_BUCKET_COUNT, JobMetricsBuffer, JobMetricsDetail, JobMetricsQuery,
-        JobMetricsSnapshot, METRIC_EXECUTION_MS, METRIC_FAILED_EXECUTIONS, METRIC_FAILED_JOBS,
-        METRIC_PANICKED_EXECUTIONS, METRIC_PANICKED_JOBS, METRIC_PROCESSED_JOBS,
-        METRIC_SUCCESSFUL_EXECUTIONS, METRICS_RETENTION_SECS, MetricIdentity,
-        QUEUE_METRIC_FAILED_JOBS, QUEUE_METRIC_PROCESSED_JOBS, QUEUE_METRIC_SUCCEEDED_JOBS,
-        QUEUE_RATE_WINDOW_MINUTES, QueueCounterTotals, QueueLengthMetricsSnapshot,
-        aggregate_counter_hashes, aggregate_queue_counter_hashes, histogram_bitfield_fetch_args,
-        histogram_bitfield_increment_args, histogram_buckets_from_counts, metric_minutes,
-        queue_length_series_from_hashes, queue_metric_field,
-    },
+    metrics::*,
     queue::{QueueRuntimeConfig, QueueState},
     result_collector::QueueResultStats,
     stats::{
@@ -301,7 +291,7 @@ impl StorageInternal {
             .scan_keys_w_conn(redis, &self.namespace_queue(pattern))
             .await?;
         // remove namespace prefix from beginning of each key
-        let prefix = format!("{}:", &self.keys.queue_prefix);
+        let prefix = format!("{}:", self.keys.queue_prefix);
         let queues = queue_keys
             .into_iter()
             .filter_map(|key| key.strip_prefix(&prefix).map(ToOwned::to_owned))
@@ -1447,37 +1437,16 @@ impl StorageInternal {
         let mut has_commands = false;
 
         for (queue, queue_stats) in stats {
-            if queue_stats.processed > 0 {
-                pipe.hincr(
-                    &self.keys.stats,
-                    format!("{queue}:processed"),
-                    queue_stats.processed,
-                );
-                has_commands = true;
-            }
-            if queue_stats.succeeded > 0 {
-                pipe.hincr(
-                    &self.keys.stats,
-                    format!("{queue}:succeeded"),
-                    queue_stats.succeeded,
-                );
-                has_commands = true;
-            }
-            if queue_stats.panicked > 0 {
-                pipe.hincr(
-                    &self.keys.stats,
-                    format!("{queue}:panicked"),
-                    queue_stats.panicked,
-                );
-                has_commands = true;
-            }
-            if queue_stats.failed > 0 {
-                pipe.hincr(
-                    &self.keys.stats,
-                    format!("{queue}:failed"),
-                    queue_stats.failed,
-                );
-                has_commands = true;
+            for (stat_name, value) in [
+                ("processed", queue_stats.processed),
+                ("succeeded", queue_stats.succeeded),
+                ("panicked", queue_stats.panicked),
+                ("failed", queue_stats.failed),
+            ] {
+                if value > 0 {
+                    pipe.hincr(&self.keys.stats, format!("{queue}:{stat_name}"), value);
+                    has_commands = true;
+                }
             }
         }
 
@@ -1556,62 +1525,14 @@ impl StorageInternal {
 
         for (minute, identity, metrics) in buffer.records() {
             let counter_key = self.metrics_counter_key(minute);
-            let processed_field = identity.metric_field(METRIC_PROCESSED_JOBS);
-            let failed_field = identity.metric_field(METRIC_FAILED_JOBS);
-            let panicked_field = identity.metric_field(METRIC_PANICKED_JOBS);
-            let successful_executions_field = identity.metric_field(METRIC_SUCCESSFUL_EXECUTIONS);
-            let failed_executions_field = identity.metric_field(METRIC_FAILED_EXECUTIONS);
-            let panicked_executions_field = identity.metric_field(METRIC_PANICKED_EXECUTIONS);
-            let execution_ms_field = identity.metric_field(METRIC_EXECUTION_MS);
-
-            if metrics.processed > 0 {
-                pipe.hincr(
-                    &counter_key,
-                    processed_field,
-                    redis_metric_increment(metrics.processed),
-                );
-            }
-            if metrics.failed > 0 {
-                pipe.hincr(
-                    &counter_key,
-                    failed_field,
-                    redis_metric_increment(metrics.failed),
-                );
-            }
-            if metrics.panicked > 0 {
-                pipe.hincr(
-                    &counter_key,
-                    panicked_field,
-                    redis_metric_increment(metrics.panicked),
-                );
-            }
-            if metrics.successful_executions > 0 {
-                pipe.hincr(
-                    &counter_key,
-                    successful_executions_field,
-                    redis_metric_increment(metrics.successful_executions),
-                );
-            }
-            if metrics.failed_executions > 0 {
-                pipe.hincr(
-                    &counter_key,
-                    failed_executions_field,
-                    redis_metric_increment(metrics.failed_executions),
-                );
-            }
-            if metrics.panicked_executions > 0 {
-                pipe.hincr(
-                    &counter_key,
-                    panicked_executions_field,
-                    redis_metric_increment(metrics.panicked_executions),
-                );
-            }
-            if metrics.execution_ms > 0 {
-                pipe.hincr(
-                    &counter_key,
-                    execution_ms_field,
-                    redis_metric_increment(metrics.execution_ms),
-                );
+            for (metric, value) in metrics.increments() {
+                if value > 0 {
+                    pipe.hincr(
+                        &counter_key,
+                        identity.metric_field(metric),
+                        redis_metric_increment(value),
+                    );
+                }
             }
             pipe.expire(&counter_key, METRICS_RETENTION_SECS);
 
@@ -1631,26 +1552,14 @@ impl StorageInternal {
         for (minute, queue, metrics) in buffer.queue_records() {
             let counter_key = self.metrics_queue_counter_key(minute);
 
-            if metrics.processed > 0 {
-                pipe.hincr(
-                    &counter_key,
-                    queue_metric_field(queue, QUEUE_METRIC_PROCESSED_JOBS),
-                    redis_metric_increment(metrics.processed),
-                );
-            }
-            if metrics.succeeded > 0 {
-                pipe.hincr(
-                    &counter_key,
-                    queue_metric_field(queue, QUEUE_METRIC_SUCCEEDED_JOBS),
-                    redis_metric_increment(metrics.succeeded),
-                );
-            }
-            if metrics.failed > 0 {
-                pipe.hincr(
-                    &counter_key,
-                    queue_metric_field(queue, QUEUE_METRIC_FAILED_JOBS),
-                    redis_metric_increment(metrics.failed),
-                );
+            for (metric, value) in metrics.increments() {
+                if value > 0 {
+                    pipe.hincr(
+                        &counter_key,
+                        queue_metric_field(queue, metric),
+                        redis_metric_increment(value),
+                    );
+                }
             }
             pipe.expire(&counter_key, METRICS_RETENTION_SECS);
         }
@@ -2212,15 +2121,7 @@ impl StorageInternal {
             return Ok(Vec::new());
         }
 
-        let fields = [
-            identity.metric_field(METRIC_PROCESSED_JOBS),
-            identity.metric_field(METRIC_FAILED_JOBS),
-            identity.metric_field(METRIC_PANICKED_JOBS),
-            identity.metric_field(METRIC_SUCCESSFUL_EXECUTIONS),
-            identity.metric_field(METRIC_FAILED_EXECUTIONS),
-            identity.metric_field(METRIC_PANICKED_EXECUTIONS),
-            identity.metric_field(METRIC_EXECUTION_MS),
-        ];
+        let fields = JOB_METRIC_KEYS.map(|metric| identity.metric_field(metric));
         let mut pipe = redis::pipe();
         for minute in minutes {
             let counter_key = self.metrics_counter_key(*minute);

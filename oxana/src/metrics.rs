@@ -42,6 +42,15 @@ pub(crate) const METRIC_SUCCESSFUL_EXECUTIONS: &str = "xs";
 pub(crate) const METRIC_FAILED_EXECUTIONS: &str = "xf";
 pub(crate) const METRIC_PANICKED_EXECUTIONS: &str = "xpn";
 pub(crate) const METRIC_EXECUTION_MS: &str = "ms";
+pub(crate) const JOB_METRIC_KEYS: [&str; 7] = [
+    METRIC_PROCESSED_JOBS,
+    METRIC_FAILED_JOBS,
+    METRIC_PANICKED_JOBS,
+    METRIC_SUCCESSFUL_EXECUTIONS,
+    METRIC_FAILED_EXECUTIONS,
+    METRIC_PANICKED_EXECUTIONS,
+    METRIC_EXECUTION_MS,
+];
 pub(crate) const QUEUE_METRIC_PROCESSED_JOBS: &str = "p";
 pub(crate) const QUEUE_METRIC_SUCCEEDED_JOBS: &str = "s";
 pub(crate) const QUEUE_METRIC_FAILED_JOBS: &str = "f";
@@ -295,6 +304,15 @@ pub(crate) struct QueueCounterTotals {
 }
 
 impl QueueCounterTotals {
+    pub(crate) fn increments(&self) -> impl Iterator<Item = (&'static str, u64)> {
+        [
+            (QUEUE_METRIC_PROCESSED_JOBS, self.processed),
+            (QUEUE_METRIC_SUCCEEDED_JOBS, self.succeeded),
+            (QUEUE_METRIC_FAILED_JOBS, self.failed),
+        ]
+        .into_iter()
+    }
+
     fn add_metric(&mut self, metric: &str, value: u64) {
         match metric {
             QUEUE_METRIC_PROCESSED_JOBS => {
@@ -389,6 +407,21 @@ pub(crate) struct PendingJobMetrics {
     pub(crate) panicked_executions: u64,
     pub(crate) execution_ms: u64,
     pub(crate) histogram: [u64; HISTOGRAM_BUCKET_COUNT],
+}
+
+impl PendingJobMetrics {
+    pub(crate) fn increments(&self) -> impl Iterator<Item = (&'static str, u64)> {
+        [
+            (METRIC_PROCESSED_JOBS, self.processed),
+            (METRIC_FAILED_JOBS, self.failed),
+            (METRIC_PANICKED_JOBS, self.panicked),
+            (METRIC_SUCCESSFUL_EXECUTIONS, self.successful_executions),
+            (METRIC_FAILED_EXECUTIONS, self.failed_executions),
+            (METRIC_PANICKED_EXECUTIONS, self.panicked_executions),
+            (METRIC_EXECUTION_MS, self.execution_ms),
+        ]
+        .into_iter()
+    }
 }
 
 #[derive(Default)]
@@ -628,17 +661,10 @@ pub(crate) fn histogram_buckets_from_counts(
 
 fn split_metric_field(field: &str) -> Option<(MetricIdentity, &str)> {
     let (identity_key, metric) = field.rsplit_once('|')?;
-    match metric {
-        METRIC_PROCESSED_JOBS
-        | METRIC_FAILED_JOBS
-        | METRIC_PANICKED_JOBS
-        | METRIC_SUCCESSFUL_EXECUTIONS
-        | METRIC_FAILED_EXECUTIONS
-        | METRIC_PANICKED_EXECUTIONS
-        | METRIC_EXECUTION_MS => {
-            MetricIdentity::from_field_key(identity_key).map(|id| (id, metric))
-        }
-        _ => None,
+    if JOB_METRIC_KEYS.contains(&metric) {
+        MetricIdentity::from_field_key(identity_key).map(|id| (id, metric))
+    } else {
+        None
     }
 }
 
@@ -692,6 +718,46 @@ mod tests {
             args,
             vec![
                 "OVERFLOW", "SAT", "INCRBY", "u16", "#0", "2", "INCRBY", "u16", "#13", "70000",
+            ]
+        );
+    }
+
+    #[test]
+    fn metric_increment_iterators_preserve_key_order() {
+        let job_metrics = PendingJobMetrics {
+            processed: 1,
+            failed: 2,
+            panicked: 3,
+            successful_executions: 4,
+            failed_executions: 5,
+            panicked_executions: 6,
+            execution_ms: 7,
+            ..PendingJobMetrics::default()
+        };
+        let increments = job_metrics.increments().collect::<Vec<_>>();
+        assert_eq!(
+            increments.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            JOB_METRIC_KEYS
+        );
+        assert_eq!(
+            increments
+                .iter()
+                .map(|(_, value)| *value)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6, 7]
+        );
+
+        let queue_counters = QueueCounterTotals {
+            processed: 8,
+            succeeded: 9,
+            failed: 10,
+        };
+        assert_eq!(
+            queue_counters.increments().collect::<Vec<_>>(),
+            vec![
+                (QUEUE_METRIC_PROCESSED_JOBS, 8),
+                (QUEUE_METRIC_SUCCEEDED_JOBS, 9),
+                (QUEUE_METRIC_FAILED_JOBS, 10),
             ]
         );
     }

@@ -218,7 +218,7 @@ where
     {
         Ok(job) => job,
         Err(e) => {
-            let err_msg = format!("Invalid job: {} - {}", &envelope.job.name, e);
+            let err_msg = format!("Invalid job: {} - {}", envelope.job.name, e);
             tracing::error!("{}", err_msg);
             if let Err(e) = config.storage.internal.kill(&envelope, err_msg).await {
                 #[cfg(feature = "sentry")]
