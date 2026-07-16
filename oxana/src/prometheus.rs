@@ -20,11 +20,45 @@
 use prometheus_client::{
     encoding::{EncodeLabelSet, text::encode},
     metrics::{family::Family, gauge::Gauge},
-    registry::Registry,
+    registry::{Metric, Registry},
 };
 use std::sync::atomic::{AtomicI64, AtomicU64};
 
 use crate::stats::Stats;
+
+fn register_i64(registry: &mut Registry, name: &str, help: &str, value: i64) {
+    let gauge = Gauge::<i64, AtomicI64>::default();
+    gauge.set(value);
+    registry.register(name, help, gauge);
+}
+
+fn register_f64(registry: &mut Registry, name: &str, help: &str, value: f64) {
+    let gauge = Gauge::<f64, AtomicU64>::default();
+    gauge.set(value);
+    registry.register(name, help, gauge);
+}
+
+fn register_family<L, M>(registry: &mut Registry, name: &str, help: &str, family: Family<L, M>)
+where
+    Family<L, M>: Metric,
+{
+    registry.register(name, help, family);
+}
+
+macro_rules! register_families {
+    (
+        $registry:expr, $labels:ty, $values:expr,
+        |$item:pat_param| $labels_value:expr;
+        $($family:ident: $gauge:ty = $name:literal => ($help:literal, $value:expr);)+)
+    => {
+        $(let $family = Family::<$labels, $gauge>::default();)+
+        for $item in $values {
+            let labels = $labels_value;
+            $($family.get_or_create(&labels).set($value);)+
+        }
+        $(register_family($registry, $name, $help, $family);)+
+    };
+}
 
 /// Label set for queue-level metrics.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -71,232 +105,67 @@ impl PrometheusMetrics {
     pub fn from_stats_with_prefix(stats: &Stats, prefix: &str) -> Self {
         let mut registry = Registry::with_prefix(prefix);
 
-        // Global metrics
-        let jobs_total = Gauge::<i64, AtomicI64>::default();
-        jobs_total.set(stats.global.jobs as i64);
-        registry.register(
-            "jobs_total",
-            "Total number of jobs (enqueued + scheduled)",
-            jobs_total,
-        );
-
-        let enqueued_total = Gauge::<i64, AtomicI64>::default();
-        enqueued_total.set(stats.global.enqueued as i64);
-        registry.register(
-            "enqueued_total",
-            "Total number of jobs currently enqueued",
-            enqueued_total,
-        );
-
-        let processed_total = Gauge::<i64, AtomicI64>::default();
-        processed_total.set(stats.global.processed);
-        registry.register(
-            "processed_total",
-            "Total number of jobs processed",
-            processed_total,
-        );
-
-        let failed_total = Gauge::<i64, AtomicI64>::default();
-        failed_total.set(stats.global.failed);
-        registry.register("failed_total", "Total number of jobs failed", failed_total);
-
-        let dead_total = Gauge::<i64, AtomicI64>::default();
-        dead_total.set(stats.global.dead as i64);
-        registry.register("dead_total", "Total number of dead jobs", dead_total);
-
-        let scheduled_total = Gauge::<i64, AtomicI64>::default();
-        scheduled_total.set(stats.global.scheduled as i64);
-        registry.register(
-            "scheduled_total",
-            "Total number of scheduled jobs",
-            scheduled_total,
-        );
-
-        let retries_total = Gauge::<i64, AtomicI64>::default();
-        retries_total.set(stats.global.retries as i64);
-        registry.register(
-            "retries_total",
-            "Total number of jobs in retry queue",
-            retries_total,
-        );
-
-        let latency_max_seconds = Gauge::<f64, AtomicU64>::default();
-        latency_max_seconds.set(stats.global.latency_s_max);
-        registry.register(
+        #[rustfmt::skip]
+        let global_metrics = [
+            ("jobs_total", "Total number of jobs (enqueued + scheduled)", stats.global.jobs as i64),
+            ("enqueued_total", "Total number of jobs currently enqueued", stats.global.enqueued as i64),
+            ("processed_total", "Total number of jobs processed", stats.global.processed),
+            ("failed_total", "Total number of jobs failed", stats.global.failed),
+            ("dead_total", "Total number of dead jobs", stats.global.dead as i64),
+            ("scheduled_total", "Total number of scheduled jobs", stats.global.scheduled as i64),
+            ("retries_total", "Total number of jobs in retry queue", stats.global.retries as i64),
+        ];
+        for (name, help, value) in global_metrics {
+            register_i64(&mut registry, name, help, value);
+        }
+        register_f64(
+            &mut registry,
             "latency_max_seconds",
             "Maximum latency across all queues in seconds",
-            latency_max_seconds,
+            stats.global.latency_s_max,
         );
 
-        // Queue metrics
-        let queue_enqueued = Family::<QueueLabels, Gauge<i64, AtomicI64>>::default();
-        let queue_processed = Family::<QueueLabels, Gauge<i64, AtomicI64>>::default();
-        let queue_succeeded = Family::<QueueLabels, Gauge<i64, AtomicI64>>::default();
-        let queue_panicked = Family::<QueueLabels, Gauge<i64, AtomicI64>>::default();
-        let queue_failed = Family::<QueueLabels, Gauge<i64, AtomicI64>>::default();
-        let queue_latency_seconds = Family::<QueueLabels, Gauge<f64, AtomicU64>>::default();
+        register_families!(
+            &mut registry, QueueLabels, &stats.queues,
+            |queue| QueueLabels { queue: queue.key.clone() };
+            queue_enqueued: Gauge<i64, AtomicI64> = "queue_enqueued" => ("Number of jobs enqueued per queue", queue.enqueued as i64);
+            queue_processed: Gauge<i64, AtomicI64> = "queue_processed_total" => ("Total number of jobs processed per queue", queue.processed);
+            queue_succeeded: Gauge<i64, AtomicI64> = "queue_succeeded_total" => ("Total number of jobs succeeded per queue", queue.succeeded);
+            queue_panicked: Gauge<i64, AtomicI64> = "queue_panicked_total" => ("Total number of jobs panicked per queue", queue.panicked);
+            queue_failed: Gauge<i64, AtomicI64> = "queue_failed_total" => ("Total number of jobs failed per queue", queue.failed);
+            queue_latency: Gauge<f64, AtomicU64> = "queue_latency_seconds" => ("Current latency per queue in seconds", queue.latency_s);
+        );
 
-        // Dynamic sub-queue metrics
-        let dynamic_queue_enqueued = Family::<DynamicQueueLabels, Gauge<i64, AtomicI64>>::default();
-        let dynamic_queue_processed =
-            Family::<DynamicQueueLabels, Gauge<i64, AtomicI64>>::default();
-        let dynamic_queue_succeeded =
-            Family::<DynamicQueueLabels, Gauge<i64, AtomicI64>>::default();
-        let dynamic_queue_panicked = Family::<DynamicQueueLabels, Gauge<i64, AtomicI64>>::default();
-        let dynamic_queue_failed = Family::<DynamicQueueLabels, Gauge<i64, AtomicI64>>::default();
-        let dynamic_queue_latency_seconds =
-            Family::<DynamicQueueLabels, Gauge<f64, AtomicU64>>::default();
-
-        // Set queue values
-        for queue_stats in &stats.queues {
-            let labels = QueueLabels {
-                queue: queue_stats.key.clone(),
+        register_families!(
+            &mut registry, DynamicQueueLabels,
+            stats.queues.iter().flat_map(|queue| queue.queues.iter().map(move |dynamic_queue| (queue, dynamic_queue))),
+            |(queue, dynamic_queue)| DynamicQueueLabels {
+                queue: queue.key.clone(),
+                suffix: dynamic_queue.suffix.clone(),
             };
-
-            queue_enqueued
-                .get_or_create(&labels)
-                .set(queue_stats.enqueued as i64);
-            queue_processed
-                .get_or_create(&labels)
-                .set(queue_stats.processed);
-            queue_succeeded
-                .get_or_create(&labels)
-                .set(queue_stats.succeeded);
-            queue_panicked
-                .get_or_create(&labels)
-                .set(queue_stats.panicked);
-            queue_failed.get_or_create(&labels).set(queue_stats.failed);
-            queue_latency_seconds
-                .get_or_create(&labels)
-                .set(queue_stats.latency_s);
-
-            // Set dynamic sub-queue values
-            for dyn_stats in &queue_stats.queues {
-                let dyn_labels = DynamicQueueLabels {
-                    queue: queue_stats.key.clone(),
-                    suffix: dyn_stats.suffix.clone(),
-                };
-
-                dynamic_queue_enqueued
-                    .get_or_create(&dyn_labels)
-                    .set(dyn_stats.enqueued as i64);
-                dynamic_queue_processed
-                    .get_or_create(&dyn_labels)
-                    .set(dyn_stats.processed);
-                dynamic_queue_succeeded
-                    .get_or_create(&dyn_labels)
-                    .set(dyn_stats.succeeded);
-                dynamic_queue_panicked
-                    .get_or_create(&dyn_labels)
-                    .set(dyn_stats.panicked);
-                dynamic_queue_failed
-                    .get_or_create(&dyn_labels)
-                    .set(dyn_stats.failed);
-                dynamic_queue_latency_seconds
-                    .get_or_create(&dyn_labels)
-                    .set(dyn_stats.latency_s);
-            }
-        }
-
-        // Register queue metrics
-        registry.register(
-            "queue_enqueued",
-            "Number of jobs enqueued per queue",
-            queue_enqueued,
-        );
-        registry.register(
-            "queue_processed_total",
-            "Total number of jobs processed per queue",
-            queue_processed,
-        );
-        registry.register(
-            "queue_succeeded_total",
-            "Total number of jobs succeeded per queue",
-            queue_succeeded,
-        );
-        registry.register(
-            "queue_panicked_total",
-            "Total number of jobs panicked per queue",
-            queue_panicked,
-        );
-        registry.register(
-            "queue_failed_total",
-            "Total number of jobs failed per queue",
-            queue_failed,
-        );
-        registry.register(
-            "queue_latency_seconds",
-            "Current latency per queue in seconds",
-            queue_latency_seconds,
+            dynamic_queue_enqueued: Gauge<i64, AtomicI64> = "dynamic_queue_enqueued" => ("Number of jobs enqueued per dynamic sub-queue", dynamic_queue.enqueued as i64);
+            dynamic_queue_processed: Gauge<i64, AtomicI64> = "dynamic_queue_processed_total" => ("Total number of jobs processed per dynamic sub-queue", dynamic_queue.processed);
+            dynamic_queue_succeeded: Gauge<i64, AtomicI64> = "dynamic_queue_succeeded_total" => ("Total number of jobs succeeded per dynamic sub-queue", dynamic_queue.succeeded);
+            dynamic_queue_panicked: Gauge<i64, AtomicI64> = "dynamic_queue_panicked_total" => ("Total number of jobs panicked per dynamic sub-queue", dynamic_queue.panicked);
+            dynamic_queue_failed: Gauge<i64, AtomicI64> = "dynamic_queue_failed_total" => ("Total number of jobs failed per dynamic sub-queue", dynamic_queue.failed);
+            dynamic_queue_latency: Gauge<f64, AtomicU64> = "dynamic_queue_latency_seconds" => ("Current latency per dynamic sub-queue in seconds", dynamic_queue.latency_s);
         );
 
-        // Register dynamic queue metrics
-        registry.register(
-            "dynamic_queue_enqueued",
-            "Number of jobs enqueued per dynamic sub-queue",
-            dynamic_queue_enqueued,
-        );
-        registry.register(
-            "dynamic_queue_processed_total",
-            "Total number of jobs processed per dynamic sub-queue",
-            dynamic_queue_processed,
-        );
-        registry.register(
-            "dynamic_queue_succeeded_total",
-            "Total number of jobs succeeded per dynamic sub-queue",
-            dynamic_queue_succeeded,
-        );
-        registry.register(
-            "dynamic_queue_panicked_total",
-            "Total number of jobs panicked per dynamic sub-queue",
-            dynamic_queue_panicked,
-        );
-        registry.register(
-            "dynamic_queue_failed_total",
-            "Total number of jobs failed per dynamic sub-queue",
-            dynamic_queue_failed,
-        );
-        registry.register(
-            "dynamic_queue_latency_seconds",
-            "Current latency per dynamic sub-queue in seconds",
-            dynamic_queue_latency_seconds,
-        );
-
-        // Process metrics
-        let process_heartbeat_timestamp = Family::<ProcessLabels, Gauge<i64, AtomicI64>>::default();
-        let process_started_timestamp = Family::<ProcessLabels, Gauge<i64, AtomicI64>>::default();
-
-        let processes_count = Gauge::<i64, AtomicI64>::default();
-        processes_count.set(stats.processes.len() as i64);
-
-        for process in &stats.processes {
-            let labels = ProcessLabels {
+        register_families!(
+            &mut registry, ProcessLabels, &stats.processes,
+            |process| ProcessLabels {
                 hostname: process.hostname.clone(),
                 pid: process.pid.to_string(),
             };
-
-            process_heartbeat_timestamp
-                .get_or_create(&labels)
-                .set(process.heartbeat_at);
-            process_started_timestamp
-                .get_or_create(&labels)
-                .set(process.started_at);
-        }
-
-        registry.register(
-            "process_heartbeat_timestamp_seconds",
-            "Last heartbeat timestamp per process",
-            process_heartbeat_timestamp,
+            process_heartbeat: Gauge<i64, AtomicI64> = "process_heartbeat_timestamp_seconds" => ("Last heartbeat timestamp per process", process.heartbeat_at);
+            process_started: Gauge<i64, AtomicI64> = "process_started_timestamp_seconds" => ("Start timestamp per process", process.started_at);
         );
-        registry.register(
-            "process_started_timestamp_seconds",
-            "Start timestamp per process",
-            process_started_timestamp,
-        );
-        registry.register(
+
+        register_i64(
+            &mut registry,
             "processes_count",
             "Number of active Oxana processes",
-            processes_count,
+            stats.processes.len() as i64,
         );
 
         Self { registry }
