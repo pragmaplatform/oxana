@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.1] - 2026-07-18
+
+### Changed
+
+- Update workspace dependencies to their latest compatible releases, including Askama and Askama Web 0.16 for the dashboard.
+
 ## [2.0.0]
 
 **Breaking release.** See [MIGRATION.md](MIGRATION.md) for the 1.x -> 2.x upgrade guide.

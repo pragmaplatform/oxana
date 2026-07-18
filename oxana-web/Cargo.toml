@@ -1,6 +1,6 @@
 [package]
 name = "oxana-web"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 license = "MIT"
 description = "Web UI for Oxana job queue system."
@@ -16,8 +16,8 @@ test = true
 [dependencies]
 oxana = { workspace = true }
 
-askama = "0.15"
-askama_web = { version = "0.15", features = ["axum-0.8"] }
+askama = "0.16"
+askama_web = { version = "0.16", features = ["axum-0.8"] }
 axum = "0.8"
 chrono = { version = "^0.4", features = ["serde"] }
 serde = { version = "^1.0", features = ["derive"] }
