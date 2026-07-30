@@ -53,20 +53,27 @@ impl oxana::Queue for QueueOne {
 
 const JOBS_COUNT: u64 = 1000;
 const CONCURRENCY: &[usize] = &[1, 2, 4, 8, 12, 16, 512];
+const SAMPLE_COUNT: u32 = 5;
 
 macro_rules! bench_jobs {
     ($name:ident, $sleep_ms:expr) => {
-        #[divan::bench(args = CONCURRENCY, sample_size = 1, sample_count = 1)]
+        #[divan::bench(args = CONCURRENCY, sample_size = 1, sample_count = SAMPLE_COUNT)]
         fn $name(bencher: divan::Bencher, n: usize) {
             let rt = &tokio::runtime::Runtime::new().unwrap();
             let storage = build_storage();
-            rt.block_on(async { setup(&storage, JOBS_COUNT, $sleep_ms).await.unwrap() });
 
-            bencher.bench(|| {
-                rt.block_on(async {
-                    execute(storage.clone(), n, JOBS_COUNT).await.unwrap();
+            bencher
+                .with_inputs(|| {
+                    rt.block_on(async {
+                        setup(&storage, JOBS_COUNT, $sleep_ms).await.unwrap();
+                    });
+                    storage.clone()
                 })
-            });
+                .bench_local_values(|storage| {
+                    rt.block_on(async {
+                        execute(storage, n, JOBS_COUNT).await.unwrap();
+                    })
+                });
         }
     };
 }
