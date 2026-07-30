@@ -52,7 +52,7 @@ impl RuntimeSettings {
             retry_poll_interval: Duration::from_millis(300),
             schedule_poll_interval: Duration::from_millis(300),
             cron_initial_offset: Duration::from_secs(3),
-            cron_lookahead: Duration::from_secs(30 * 60),
+            cron_lookahead: Duration::from_secs(30),
             cron_tick_interval: Duration::from_secs(1),
             dequeue_timeout: Duration::from_secs(10),
             dispatcher_idle_sleep: Duration::from_secs(1),
@@ -150,21 +150,24 @@ impl<DT> Config<DT> {
             }
         }
 
-        self.registry.register_worker_with(WorkerConfig {
-            name,
-            legacy_names: vec![std::any::type_name::<W>().to_owned()],
-            factory,
-            batch_factory,
-            batch_config,
-            on_demand,
-            kind,
-        });
+        self.registry.register_worker_with(
+            WorkerConfig {
+                name,
+                legacy_names: vec![std::any::type_name::<W>().to_owned()],
+                factory,
+                batch_factory,
+                batch_config,
+                on_demand,
+                kind,
+            },
+            Some(worker_registry::cron_envelope_factory::<A>),
+        );
         self
     }
 
     /// Registers a worker from a [`WorkerConfig`].
     pub fn register_worker_with(&mut self, config: WorkerConfig<DT>) {
-        self.registry.register_worker_with(config);
+        self.registry.register_worker_with(config, None);
     }
 
     /// Returns a catalog of all registered workers.
@@ -365,6 +368,25 @@ mod tests {
     impl_test_worker!(AlphaWorker, AlphaJob);
 
     #[test]
+    #[should_panic(expected = "manual cron worker registration is not supported")]
+    fn manual_cron_worker_config_requires_typed_factory() {
+        let mut config = Config::<()>::new();
+        config.register_worker_with(WorkerConfig {
+            name: PlainJob::name().to_string(),
+            legacy_names: Vec::new(),
+            factory: worker_registry::job_factory::<PlainWorker, PlainJob, ()>,
+            batch_factory: worker_registry::job_batch_factory::<PlainWorker, PlainJob, ()>,
+            batch_config: None,
+            on_demand: None,
+            kind: WorkerConfigKind::Cron {
+                schedule: "*/5 * * * * *".to_string(),
+                queue_key: "default".to_string(),
+                resurrect: true,
+            },
+        });
+    }
+
+    #[test]
     fn worker_registration_accepts_canonical_and_legacy_worker_names() {
         let config = Config::<()>::new().register_worker::<PlainWorker, PlainJob>();
         let job = serde_json::json!({
@@ -478,6 +500,107 @@ mod tests {
             )
             .expect("legacy cron worker name should build");
         assert_eq!(legacy.len(), 1);
+    }
+
+    #[test]
+    fn cron_envelopes_compute_unique_id_from_each_job_instance() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static WORKER_BUILDS: AtomicU64 = AtomicU64::new(0);
+
+        fn next_id() -> u64 {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        }
+
+        #[derive(Debug, Serialize, Deserialize)]
+        struct DynamicCronJob {
+            #[serde(default = "next_id")]
+            id: u64,
+        }
+
+        impl oxana::Job for DynamicCronJob {
+            fn unique_id(&self) -> Option<String> {
+                Some(self.id.to_string())
+            }
+        }
+
+        #[derive(Serialize)]
+        struct DynamicCronQueue;
+
+        impl oxana::Queue for DynamicCronQueue {
+            fn to_config() -> oxana::QueueConfig {
+                oxana::QueueConfig::as_static("dynamic_cron")
+            }
+        }
+
+        struct DynamicCronWorker;
+
+        impl oxana::FromContext<()> for DynamicCronWorker {
+            fn from_context(_ctx: &()) -> Self {
+                WORKER_BUILDS.fetch_add(1, Ordering::Relaxed);
+                Self
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl oxana::Worker<DynamicCronJob> for DynamicCronWorker {
+            type Error = WorkerError;
+
+            async fn run_batch(
+                &self,
+                _jobs: Vec<oxana::BatchItem<DynamicCronJob>>,
+            ) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn cron_schedule() -> Option<String> {
+                Some("*/5 * * * * *".to_string())
+            }
+
+            fn cron_queue_config() -> Option<oxana::QueueConfig> {
+                Some(<DynamicCronQueue as oxana::Queue>::to_config())
+            }
+        }
+
+        let config = Config::<()>::new().register_worker::<DynamicCronWorker, DynamicCronJob>();
+        let first = config
+            .registry
+            .cron_envelope(DynamicCronJob::name(), 123)
+            .expect("first cron envelope should build")
+            .0;
+        let second = config
+            .registry
+            .cron_envelope(DynamicCronJob::name(), 456)
+            .expect("second cron envelope should build")
+            .0;
+
+        let first_arg_id = first
+            .job
+            .args
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .expect("first cron args should contain an id");
+        let second_arg_id = second
+            .job
+            .args
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .expect("second cron args should contain an id");
+        assert_ne!(first_arg_id, second_arg_id);
+        assert_eq!(
+            first.id,
+            format!("{}/{first_arg_id}", DynamicCronJob::name())
+        );
+        assert_eq!(
+            second.id,
+            format!("{}/{second_arg_id}", DynamicCronJob::name())
+        );
+        assert_eq!(
+            WORKER_BUILDS.load(Ordering::Relaxed),
+            0,
+            "building cron envelopes must not construct workers"
+        );
     }
 
     #[test]

@@ -227,7 +227,7 @@ where
         self
     }
 
-    /// Sets how far ahead cron occurrences are scheduled. Defaults to 30 minutes.
+    /// Sets how far ahead cron occurrences are scheduled. Defaults to 30 seconds.
     pub fn cron_lookahead(mut self, lookahead: Duration) -> Self {
         self.settings.cron_lookahead = lookahead;
         self

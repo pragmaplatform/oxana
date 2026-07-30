@@ -143,6 +143,10 @@ Jobs carry the data that gets enqueued and define enqueue-time metadata. Workers
 |  | `#[oxana(cron(schedule = "*/5 * * * * *", queue = MyQueue))]` - schedule periodic jobs |
 |  | `#[oxana(batch_size = 100, batch_timeout_ms = 500)]` - process jobs in batches |
 
+Cron jobs may define a `unique_id` to prevent overlapping occurrences. Their conflict strategy
+must be `Skip`; `on_conflict = Replace` is rejected because replacing an in-flight occurrence can
+corrupt the following occurrence.
+
 For job hooks, `Self::...` resolves to the job type. For worker hooks, `Self::...` resolves to the worker type.
 
 On-demand argument templates infer editable placeholders from field types. Numeric primitives and common numeric ID newtypes named `*Id` or `*ID` are prefilled with `0`.

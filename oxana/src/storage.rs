@@ -772,7 +772,7 @@ mod tests {
         assert_eq!(settings.retry_poll_interval, Duration::from_millis(300));
         assert_eq!(settings.schedule_poll_interval, Duration::from_millis(300));
         assert_eq!(settings.cron_initial_offset, Duration::from_secs(3));
-        assert_eq!(settings.cron_lookahead, Duration::from_secs(30 * 60));
+        assert_eq!(settings.cron_lookahead, Duration::from_secs(30));
         assert_eq!(settings.cron_tick_interval, Duration::from_secs(1));
         assert_eq!(settings.dequeue_timeout, Duration::from_secs(10));
         assert_eq!(settings.dispatcher_idle_sleep, Duration::from_secs(1));
@@ -824,6 +824,16 @@ mod tests {
         assert_eq!(settings.shutdown_timeout, Duration::from_millis(23));
         assert_eq!(settings.exit_when_processed, Some(24));
         assert_eq!(storage.dead_process_threshold(), Duration::from_millis(12));
+    }
+
+    #[test]
+    fn cron_lookahead_allows_values_above_the_default() {
+        let settings = test_storage()
+            .runtime(())
+            .cron_lookahead(Duration::from_secs(60))
+            .settings();
+
+        assert_eq!(settings.cron_lookahead, Duration::from_secs(60));
     }
 
     #[test]

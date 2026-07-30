@@ -10,7 +10,6 @@ use crate::error::OxanaError;
 use crate::result_collector::Stats;
 use crate::runtime::Runtime;
 use crate::storage::Storage;
-use crate::storage_internal::StorageInternal;
 use crate::worker_registry::CronJob;
 
 pub(crate) async fn run<DT>(
@@ -220,9 +219,7 @@ where
 
     for (name, cron_job) in &runtime.registry.schedules {
         set.spawn(cron_job_loop(
-            runtime.storage.internal.clone(),
-            runtime.cancel_token.clone(),
-            runtime.settings.clone(),
+            Arc::clone(&runtime),
             name.clone(),
             cron_job.clone(),
         ));
@@ -231,20 +228,30 @@ where
     if set.is_empty() {
         runtime.cancel_token.cancelled().await;
     } else {
-        set.join_all().await;
+        while let Some(result) = set.join_next().await {
+            result??;
+        }
     }
     Ok(())
 }
 
-async fn cron_job_loop(
-    storage: StorageInternal,
-    cancel_token: CancellationToken,
-    settings: RuntimeSettings,
+async fn cron_job_loop<DT>(
+    runtime: Arc<Runtime<DT>>,
     job_name: String,
     cron_job: CronJob,
-) -> Result<(), OxanaError> {
+) -> Result<(), OxanaError>
+where
+    DT: Send + Sync + Clone + 'static,
+{
+    let storage = runtime.storage.internal.clone();
+    let registry = runtime.registry.clone();
     storage
-        .cron_job_loop(cancel_token, settings, job_name.clone(), cron_job)
+        .cron_job_loop(
+            runtime.cancel_token.clone(),
+            runtime.settings.clone(),
+            cron_job,
+            |scheduled_at| registry.cron_envelope(&job_name, scheduled_at),
+        )
         .await?;
 
     tracing::trace!("Cron job loop finished for {}", job_name);

@@ -100,35 +100,49 @@ impl JobEnvelope {
         Ok(Self::new(queue, job)?.with_scheduled_at(scheduled_at))
     }
 
-    pub(crate) fn new_cron(
+    pub(crate) fn new_cron<T: Job + 'static>(
         queue: String,
-        id: String,
-        name: String,
+        occurrence_id: String,
+        job: &T,
         scheduled_at: i64,
         resurrect: bool,
-    ) -> Result<Self, OxanaError> {
+    ) -> Result<(Self, bool), OxanaError> {
         let now = chrono::Utc::now().timestamp_micros();
-        Ok(Self {
-            id: id.clone(),
-            queue,
-            job: JobData {
-                name,
-                args: serde_json::json!({}),
+        let name = T::name().to_string();
+        let on_conflict = job.on_conflict();
+        if matches!(on_conflict, JobConflictStrategy::Replace) {
+            return Err(OxanaError::GenericError(format!(
+                "{name}: cron jobs do not support `on_conflict = Replace`; use `Skip`"
+            )));
+        }
+        let (id, on_conflict, declared_unique) = match job.unique_id() {
+            Some(unique_id) => (format!("{name}/{unique_id}"), on_conflict, true),
+            None => (occurrence_id, JobConflictStrategy::Skip, false),
+        };
+        Ok((
+            Self {
+                id: id.clone(),
+                queue,
+                job: JobData {
+                    name,
+                    args: serde_json::to_value(job)?,
+                },
+                meta: JobMeta {
+                    id,
+                    retries: 0,
+                    unique: true,
+                    on_conflict: Some(on_conflict),
+                    created_at: now,
+                    scheduled_at: scheduled_at.max(now),
+                    started_at: None,
+                    state: None,
+                    resurrect,
+                    error: None,
+                    throttle_cost: None,
+                },
             },
-            meta: JobMeta {
-                id,
-                retries: 0,
-                unique: true,
-                on_conflict: Some(JobConflictStrategy::Skip),
-                created_at: now,
-                scheduled_at: scheduled_at.max(now),
-                started_at: None,
-                state: None,
-                resurrect,
-                error: None,
-                throttle_cost: None,
-            },
-        })
+            declared_unique,
+        ))
     }
 
     pub(crate) fn with_scheduled_at(mut self, scheduled_at: DateTime<Utc>) -> Self {
@@ -333,19 +347,52 @@ mod tests {
 
     #[test]
     fn test_cannot_schedule_cron_in_past() {
+        #[derive(Serialize)]
+        struct CronJob {}
+
+        impl Job for CronJob {}
+
         let past = Utc::now().timestamp_micros() - 3_600_000_000;
         let envelope = JobEnvelope::new_cron(
             "default".to_string(),
             "cron-job-1".to_string(),
-            "CronJob".to_string(),
+            &CronJob {},
             past,
             true,
         )
-        .unwrap();
+        .unwrap()
+        .0;
 
         let drift_micros = Utc::now().timestamp_micros() - envelope.meta.scheduled_at;
         assert!(drift_micros >= 0);
         assert!(drift_micros < 1_000_000);
+    }
+
+    #[test]
+    fn cron_envelope_rejects_replace_conflict() {
+        #[derive(Serialize)]
+        struct ReplaceCronJob {}
+
+        impl Job for ReplaceCronJob {
+            fn on_conflict(&self) -> JobConflictStrategy {
+                JobConflictStrategy::Replace
+            }
+        }
+
+        let error = JobEnvelope::new_cron(
+            "default".to_string(),
+            "CronJob-123".to_string(),
+            &ReplaceCronJob {},
+            Utc::now().timestamp_micros(),
+            true,
+        )
+        .expect_err("replace conflict should be rejected for cron jobs");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cron jobs do not support `on_conflict = Replace`; use `Skip`")
+        );
     }
 
     #[test]

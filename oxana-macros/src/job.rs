@@ -138,11 +138,16 @@ pub fn expand_derive_job(input: DeriveInput) -> TokenStream {
     };
 
     let on_conflict = match &args.on_conflict {
-        Some(on_conflict) => quote! {
-            fn on_conflict(&self) -> oxana::JobConflictStrategy {
-                oxana::JobConflictStrategy::#on_conflict
+        Some(on_conflict) => {
+            let replaces_on_conflict = on_conflict == "Replace";
+            quote! {
+                const REPLACES_ON_CONFLICT: bool = #replaces_on_conflict;
+
+                fn on_conflict(&self) -> oxana::JobConflictStrategy {
+                    oxana::JobConflictStrategy::#on_conflict
+                }
             }
-        },
+        }
         None => quote!(),
     };
 

@@ -1,6 +1,9 @@
 use crate::{QueueConfig, RuntimeBuilder, worker_registry::WorkerConfig};
 
-pub struct ComponentRegistry<DT> {
+pub struct ComponentRegistry<DT>
+where
+    DT: Clone + Send + Sync + 'static,
+{
     /// `module_path!()`
     pub module_path: &'static str,
     /// `stringify!(MyStruct)`
@@ -8,9 +11,13 @@ pub struct ComponentRegistry<DT> {
     pub definition: fn() -> ComponentDefinition<DT>,
 }
 
-pub enum ComponentDefinition<DT> {
+pub enum ComponentDefinition<DT>
+where
+    DT: Clone + Send + Sync + 'static,
+{
     Queue(QueueConfig),
     Worker(WorkerConfig<DT>),
+    WorkerRegistration(fn(RuntimeBuilder<DT>) -> RuntimeBuilder<DT>),
 }
 
 pub trait RegisterComponents {
@@ -46,6 +53,7 @@ where
             match (component.definition)() {
                 ComponentDefinition::Queue(q) => runtime = runtime.queue_with(q),
                 ComponentDefinition::Worker(w) => runtime = runtime.worker_with(w),
+                ComponentDefinition::WorkerRegistration(register) => runtime = register(runtime),
             }
         }
         runtime
