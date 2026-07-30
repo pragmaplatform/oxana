@@ -2,13 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.0] - 2026-07-30
+
+### Added
+
+- Allow cron jobs to define a `unique_id` with the `Skip` conflict strategy, preventing overlapping occurrences of the same cron job. The unsafe `Replace` strategy is rejected at compile time for cron jobs.
+
 ## [2.0.1] - 2026-07-18
 
 ### Changed
 
 - Update workspace dependencies to their latest compatible releases, including Askama and Askama Web 0.16 for the dashboard.
+- Unify single-job and batch execution paths while preserving single-job logging and behavior.
+- Make metric flushing data-driven and simplify Prometheus metric registration.
 
-## [2.0.0]
+### Fixed
+
+- Order dashboard queues by enqueued count by default so the busiest queues appear first, with deterministic queue-key tie-breaking.
+
+## [2.0.0] - 2026-06-27
 
 **Breaking release.** See [MIGRATION.md](MIGRATION.md) for the 1.x -> 2.x upgrade guide.
 
