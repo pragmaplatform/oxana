@@ -28,6 +28,28 @@ const SCAN_BATCH_SIZE: usize = 500;
 const ENQUEUE_LIST_CHUNK_SIZE: usize = 100;
 const QUEUE_LENGTH_SNAPSHOT_TTL_SECS: i64 = 120;
 
+#[derive(Debug, PartialEq, Eq)]
+enum UniqueCronAction {
+    Enqueue,
+    Wait,
+    Skip,
+}
+
+fn unique_cron_action(
+    existing_job: bool,
+    previously_observed_existing_job: bool,
+    scheduled_at: i64,
+    now: i64,
+) -> UniqueCronAction {
+    if now >= scheduled_at && (existing_job || previously_observed_existing_job) {
+        UniqueCronAction::Skip
+    } else if existing_job {
+        UniqueCronAction::Wait
+    } else {
+        UniqueCronAction::Enqueue
+    }
+}
+
 fn unix_timestamp_secs_f64() -> f64 {
     chrono::Utc::now().timestamp_millis() as f64 / 1000.0
 }
@@ -1850,13 +1872,16 @@ impl StorageInternal {
         }
     }
 
-    pub async fn cron_job_loop(
+    pub async fn cron_job_loop<F>(
         &self,
         cancel_token: CancellationToken,
         settings: crate::config::RuntimeSettings,
-        job_name: String,
         cron_job: CronJob,
-    ) -> Result<(), OxanaError> {
+        mut envelope_factory: F,
+    ) -> Result<(), OxanaError>
+    where
+        F: FnMut(i64) -> Result<(JobEnvelope, bool), OxanaError> + Send,
+    {
         // Clamp instead of panicking: out-of-range offsets overflow both
         // chrono::Duration and the DateTime addition.
         let initial_offset = chrono::Duration::from_std(settings.cron_initial_offset)
@@ -1897,28 +1922,62 @@ impl StorageInternal {
             }
 
             let scheduled_at = next.timestamp_micros();
-            let job_id = format!("{job_name}-{scheduled_at}");
+            let (envelope, declared_unique) = envelope_factory(scheduled_at)?;
 
-            loop {
-                if cancel_token.is_cancelled() {
-                    return Ok(());
+            let should_enqueue = if declared_unique {
+                let mut observed_existing_job = false;
+                loop {
+                    if cancel_token.is_cancelled() {
+                        return Ok(());
+                    }
+                    let action = match self.track_redis_result(
+                        self.get_job(&envelope.id).await,
+                        settings.redis_failure_tolerance,
+                    )? {
+                        Some(existing) => {
+                            let existing_job = existing.is_some();
+                            let action = unique_cron_action(
+                                existing_job,
+                                observed_existing_job,
+                                scheduled_at,
+                                chrono::Utc::now().timestamp_micros(),
+                            );
+                            observed_existing_job |= existing_job;
+                            action
+                        }
+                        None => UniqueCronAction::Wait,
+                    };
+                    match action {
+                        UniqueCronAction::Skip => {
+                            tracing::warn!(
+                                "Unique cron job {} is still active at its next occurrence, skipping",
+                                envelope.id
+                            );
+                            break false;
+                        }
+                        UniqueCronAction::Wait => {
+                            tokio::time::sleep(settings.cron_tick_interval).await;
+                        }
+                        UniqueCronAction::Enqueue => break true,
+                    }
                 }
+            } else {
+                true
+            };
 
-                let envelope = JobEnvelope::new_cron(
-                    cron_job.queue_key.clone(),
-                    job_id.clone(),
-                    job_name.clone(),
-                    scheduled_at,
-                    cron_job.resurrect,
-                )?;
-
-                match self.track_redis_result(
-                    self.enqueue_at(envelope).await,
-                    settings.redis_failure_tolerance,
-                )? {
-                    Some(_) => break,
-                    None => {
-                        tokio::time::sleep(settings.cron_tick_interval).await;
+            if should_enqueue {
+                loop {
+                    if cancel_token.is_cancelled() {
+                        return Ok(());
+                    }
+                    match self.track_redis_result(
+                        self.enqueue_at(envelope.clone()).await,
+                        settings.redis_failure_tolerance,
+                    )? {
+                        Some(_) => break,
+                        None => {
+                            tokio::time::sleep(settings.cron_tick_interval).await;
+                        }
                     }
                 }
             }
@@ -2240,6 +2299,26 @@ mod tests {
 
     impl crate::worker::Job for TestJob {}
 
+    #[test]
+    fn unique_cron_skips_an_observed_occurrence_if_it_vanishes_after_due() {
+        assert_eq!(
+            unique_cron_action(true, false, 2_000, 1_000),
+            UniqueCronAction::Wait
+        );
+        assert_eq!(
+            unique_cron_action(true, true, 2_000, 2_000),
+            UniqueCronAction::Skip
+        );
+        assert_eq!(
+            unique_cron_action(false, false, 2_000, 1_000),
+            UniqueCronAction::Enqueue
+        );
+        assert_eq!(
+            unique_cron_action(false, true, 2_000, 2_000),
+            UniqueCronAction::Skip
+        );
+    }
+
     fn assert_close(actual: f64, expected: f64) {
         assert!(
             (actual - expected).abs() < 1e-9,
@@ -2486,10 +2565,11 @@ mod tests {
         let envelope = JobEnvelope::new_cron(
             queue.clone(),
             "CronWorker-1234567890".to_string(),
-            "CronWorker".to_string(),
+            &TestJob {},
             1234567890,
             true,
-        )?;
+        )?
+        .0;
 
         assert!(envelope.meta.unique);
         assert_eq!(envelope.meta.on_conflict, Some(JobConflictStrategy::Skip));
@@ -3501,6 +3581,40 @@ mod tests {
         assert!(job.meta.scheduled_at <= (after + delay));
         assert_eq!(job.meta.retries, 0);
         assert!(job.meta.error.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_at_unique_skip_keeps_existing_occurrence() -> TestResult {
+        #[derive(Serialize)]
+        struct UniqueTestJob;
+
+        impl crate::worker::Job for UniqueTestJob {
+            fn unique_id(&self) -> Option<String> {
+                Some("singleton".to_string())
+            }
+        }
+
+        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let queue = random_string();
+        let envelope = JobEnvelope::new(queue, UniqueTestJob)?;
+        let first_at = chrono::Utc::now() + chrono::Duration::seconds(60);
+        let second_at = first_at + chrono::Duration::seconds(60);
+
+        storage
+            .enqueue_at(envelope.clone().with_scheduled_at(first_at))
+            .await?;
+        storage
+            .enqueue_at(envelope.clone().with_scheduled_at(second_at))
+            .await?;
+
+        assert_eq!(storage.scheduled_count().await?, 1);
+        let job = storage
+            .get_job(&envelope.id)
+            .await?
+            .expect("first occurrence should remain scheduled");
+        assert_eq!(job.meta.scheduled_at, first_at.timestamp_micros());
 
         Ok(())
     }

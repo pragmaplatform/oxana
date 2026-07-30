@@ -8,4 +8,4 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 oxana = { version = "2.0.1", path = "oxana" }
-oxana-macros = { version = "2.0.1", path = "oxana-macros" }
+oxana-macros = { version = "=2.0.1", path = "oxana-macros" }

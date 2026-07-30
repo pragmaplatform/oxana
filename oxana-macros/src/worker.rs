@@ -104,9 +104,18 @@ pub fn expand_derive_worker(input: DeriveInput) -> TokenStream {
 
     let worker_impl = expand_worker_impl(struct_ident, &type_args, &type_error, &args);
     let from_context_impl = expand_from_context_impl(struct_ident, &type_context, &input);
-    let registry_impl = expand_registry(struct_ident, &type_args, &type_context, &args);
+    let registry_impl = expand_registry(struct_ident, &type_args, &args);
+    let cron_conflict_validation = args.cron.as_ref().map_or_else(TokenStream::new, |_| {
+        quote! {
+            const _: () = assert!(
+                !<#type_args as oxana::Job>::REPLACES_ON_CONFLICT,
+                "cron jobs do not support `on_conflict = Replace`; use `Skip`"
+            );
+        }
+    });
 
     quote! {
+        #cron_conflict_validation
         #worker_impl
         #from_context_impl
         #registry_impl
@@ -225,12 +234,7 @@ fn expand_from_context_impl(
     }
 }
 
-fn expand_registry(
-    struct_ident: &Ident,
-    type_args: &TokenStream,
-    type_context: &TokenStream,
-    args: &OxanaArgs,
-) -> TokenStream {
+fn expand_registry(struct_ident: &Ident, type_args: &TokenStream, args: &OxanaArgs) -> TokenStream {
     let component_registry = match &args.registry {
         Some(registry) => quote!(#registry),
         None => quote!(ComponentRegistry),
@@ -243,20 +247,9 @@ fn expand_registry(
                     module_path: module_path!(),
                     type_name: stringify!(#struct_ident),
                     definition: || {
-                        oxana::ComponentDefinition::Worker(oxana::WorkerConfig {
-                            name: <#type_args as oxana::Job>::name().to_owned(),
-                            legacy_names: vec![std::any::type_name::<#struct_ident>().to_owned()],
-                            factory: oxana::job_factory::<#struct_ident, #type_args, #type_context>,
-                            batch_factory: oxana::job_batch_factory::<#struct_ident, #type_args, #type_context>,
-                            batch_config: <#struct_ident as oxana::Worker<#type_args>>::batch_config(),
-                            on_demand: <#type_args as oxana::Job>::on_demand_args_template().map(|args_template| {
-                                oxana::OnDemandJobRegistration {
-                                    args_template,
-                                    enqueue_factory: oxana::job_envelope_factory::<#type_args>,
-                                }
-                            }),
-                            kind: <#struct_ident as oxana::Worker<#type_args>>::to_config(),
-                        })
+                        oxana::ComponentDefinition::WorkerRegistration(
+                            |runtime| runtime.worker::<#struct_ident, #type_args>()
+                        )
                     }
                 })
             }

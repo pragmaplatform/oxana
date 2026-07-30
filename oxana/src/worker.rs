@@ -24,6 +24,9 @@ impl WorkerBatchConfig {
 }
 
 pub trait Job: Send + serde::Serialize {
+    #[doc(hidden)]
+    const REPLACES_ON_CONFLICT: bool = false;
+
     fn name() -> &'static str
     where
         Self: Sized + 'static,
@@ -743,6 +746,7 @@ mod tests {
         struct DefaultQueue;
 
         #[derive(Debug, Serialize, Deserialize, oxana::Job)]
+        #[oxana(unique_id = "test_cron", on_conflict = Skip)]
         struct TestCronJob {}
 
         #[derive(oxana::Worker)]

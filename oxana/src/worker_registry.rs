@@ -9,6 +9,8 @@ use crate::worker::{BoundBatchJob, BoundJob, BoxedProcessable, FromContext, Job,
 pub type JobFactory<DT> = fn(serde_json::Value, &DT) -> Result<BoxedProcessable, OxanaError>;
 pub type JobBatchFactory<DT> = fn(Vec<serde_json::Value>, &DT) -> Result<BatchBuild, OxanaError>;
 pub type JobEnvelopeFactory = fn(String, serde_json::Value) -> Result<JobEnvelope, OxanaError>;
+pub(crate) type CronEnvelopeFactory =
+    fn(String, String, i64, bool) -> Result<(JobEnvelope, bool), OxanaError>;
 
 #[derive(Clone)]
 pub struct OnDemandJobRegistration {
@@ -118,11 +120,27 @@ where
     JobEnvelope::new(queue, job)
 }
 
+pub(crate) fn cron_envelope_factory<A>(
+    queue: String,
+    occurrence_id: String,
+    scheduled_at: i64,
+    resurrect: bool,
+) -> Result<(JobEnvelope, bool), OxanaError>
+where
+    A: Job + serde::de::DeserializeOwned + Send + 'static,
+{
+    let job: A = serde_json::from_value(serde_json::json!({})).map_err(|error| {
+        OxanaError::JobFactoryError(format!("Failed to build job {}: {error}", A::name()))
+    })?;
+    JobEnvelope::new_cron(queue, occurrence_id, &job, scheduled_at, resurrect)
+}
+
 #[derive(Clone)]
 struct WorkerFactories<DT> {
     factory: JobFactory<DT>,
     batch_factory: JobBatchFactory<DT>,
     batch_config: Option<WorkerBatchConfig>,
+    cron_envelope_factory: Option<CronEnvelopeFactory>,
 }
 
 impl<DT> WorkerRegistry<DT> {
@@ -135,13 +153,23 @@ impl<DT> WorkerRegistry<DT> {
         }
     }
 
-    pub fn register_worker_with(&mut self, config: WorkerConfig<DT>) {
+    pub fn register_worker_with(
+        &mut self,
+        config: WorkerConfig<DT>,
+        cron_envelope_factory: Option<CronEnvelopeFactory>,
+    ) {
+        assert!(
+            cron_envelope_factory.is_some()
+                || !matches!(&config.kind, WorkerConfigKind::Cron { .. }),
+            "manual cron worker registration is not supported; use typed worker registration"
+        );
         let name = config.name;
         let legacy_names = config.legacy_names;
         let factories = WorkerFactories {
             factory: config.factory,
             batch_factory: config.batch_factory,
             batch_config: config.batch_config,
+            cron_envelope_factory,
         };
 
         if let Some(alias_target) = self.aliases.remove(&name) {
@@ -223,6 +251,26 @@ impl<DT> WorkerRegistry<DT> {
                 "Failed to build job {name}: {e}"
             ))),
         }
+    }
+
+    pub(crate) fn cron_envelope(
+        &self,
+        name: &str,
+        scheduled_at: i64,
+    ) -> Result<(JobEnvelope, bool), OxanaError> {
+        let cron_job = self.schedules.get(name).ok_or_else(|| {
+            OxanaError::GenericError(format!("Cron job type {name} not registered"))
+        })?;
+        let factory = self
+            .factories_for(name)
+            .and_then(|factories| factories.cron_envelope_factory)
+            .expect("cron workers always have a typed envelope factory");
+        factory(
+            cron_job.queue_key.clone(),
+            format!("{name}-{scheduled_at}"),
+            scheduled_at,
+            cron_job.resurrect,
+        )
     }
 
     pub(crate) fn build_batch(

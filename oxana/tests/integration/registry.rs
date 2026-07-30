@@ -54,6 +54,18 @@ impl CronWorkerCounter {
     }
 }
 
+#[test]
+fn registry_cron_workers_keep_typed_registration() {
+    let component = oxana::iterate_components::<ComponentRegistry>()
+        .find(|component| component.0.type_name == stringify!(CronWorkerCounter))
+        .expect("cron worker should be present in the component registry");
+
+    assert!(matches!(
+        (component.0.definition)(),
+        oxana::ComponentDefinition::WorkerRegistration(_)
+    ));
+}
+
 #[tokio::test]
 pub async fn test_registry() -> TestResult {
     let redis_pool = setup();

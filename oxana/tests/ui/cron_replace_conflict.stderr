@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: cron jobs do not support `on_conflict = Replace`; use `Skip`
+  --> tests/ui/cron_replace_conflict.rs:17:10
+   |
+17 | #[derive(oxana::Worker)]
+   |          ^^^^^^^^^^^^^ evaluation of `_` failed here
