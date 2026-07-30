@@ -16,10 +16,10 @@ jobs:
 
     services:
       redis:
-        image: redis
+        image: redis:8
+        command: redis-server --save "" --appendonly no
         ports:
           - 6379:6379
-        options: --entrypoint redis-server
 
     env:
       CARGO_TERM_COLOR: always
@@ -48,6 +48,8 @@ jobs:
 
       - name: Benchmark
         run: cargo bench
+        env:
+          RUST_LOG: "off"
 
       - name: Publish
         if: github.ref == 'refs/heads/main'
