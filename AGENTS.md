@@ -11,7 +11,7 @@ This file provides guidance to any coding agent (Claude, ChatGPT, etc.) when wor
 - `cargo test <test_name>` - Run specific tests by name
 - `cargo bench` - Run benchmarks (uses divan benchmarking framework)
 - `cargo check --all` - Quick syntax and type checking without building
-- `cargo fmt --workspace` - Format the codebase
+- `cargo fmt --all` - Format the codebase (`cargo fmt --all -- --check` to verify only)
 - `cargo clippy --all-features --workspace` - Run Rust linter with extensive warnings enabled
 - `cargo doc` - Generate documentation
 
