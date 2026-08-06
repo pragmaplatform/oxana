@@ -2,12 +2,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 use crate::JobId;
 use crate::error::OxanaError;
 use crate::queue::{QueueConfig, QueueThrottle};
 use crate::runtime::Runtime;
-use crate::semaphores_map::QueueControl;
+use crate::semaphores_map::{QueueControl, QueuePermit};
 use crate::storage_internal::StorageInternal;
 use crate::throttler::Throttler;
 use crate::worker_event::WorkerJob;
@@ -23,12 +24,9 @@ where
     DT: Send + Sync + Clone + 'static,
 {
     loop {
-        let permit = tokio::select! {
-            permit = queue_control.acquire() => permit,
-            _ = config.cancel_token.cancelled() => {
-                tracing::debug!("Stopping dispatcher for queue {}", queue_key);
-                break;
-            }
+        let Some(permit) = acquire_while_running(&config.cancel_token, &queue_control).await else {
+            tracing::debug!("Stopping dispatcher for queue {}", queue_key);
+            break;
         };
 
         tokio::select! {
@@ -59,6 +57,17 @@ where
     }
 
     Ok(())
+}
+
+async fn acquire_while_running(
+    cancel_token: &CancellationToken,
+    queue_control: &Arc<QueueControl>,
+) -> Option<QueuePermit> {
+    tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => None,
+        permit = queue_control.acquire() => Some(permit),
+    }
 }
 
 async fn pop_queue_message(
@@ -132,13 +141,27 @@ mod tests {
     use testresult::TestResult;
     use tokio::sync::mpsc;
 
-    use super::run;
+    use super::{acquire_while_running, run};
     use crate::config::{Config, RuntimeSettings};
     use crate::runtime::Runtime;
     use crate::semaphores_map::QueueControlsMap;
     use crate::test_helper::random_string;
     use crate::worker_event::WorkerJob;
     use crate::{QueueConfig, QueueRuntimeConfig, Storage, StorageBuilderTimeouts};
+
+    #[tokio::test]
+    async fn cancelled_dispatcher_does_not_acquire_available_capacity() {
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        cancel_token.cancel();
+        let queue_controls = QueueControlsMap::new();
+        let queue_control = queue_controls
+            .get_or_create("queue".to_string(), QueueRuntimeConfig::new(1))
+            .await;
+
+        let permit = acquire_while_running(&cancel_token, &queue_control).await;
+
+        assert!(permit.is_none());
+    }
 
     #[tokio::test]
     async fn idle_dispatcher_does_not_hold_pool_connection() -> TestResult {
