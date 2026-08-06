@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- Prepare a fresh workload for each benchmark sample and stabilize the benchmark environment in CI.
+- Prepare a fresh workload for each benchmark sample, stabilize the benchmark environment, and allow CI enough time to finish benchmarks.
 - Support local and cloud Conductor workspaces in the setup and archive scripts.
 
 ### Fixed
