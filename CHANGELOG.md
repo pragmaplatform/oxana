@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.1] - 2026-08-06
+
+### Changed
+
+- Prepare a fresh workload for each benchmark sample, stabilize the benchmark environment, and allow CI enough time to finish benchmarks.
+- Support local and cloud Conductor workspaces in the setup and archive scripts.
+
+### Fixed
+
+- Stop dispatchers from acquiring new jobs after graceful shutdown begins.
+
 ## [2.1.0] - 2026-07-30
 
 ### Added
