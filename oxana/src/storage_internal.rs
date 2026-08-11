@@ -674,7 +674,24 @@ impl StorageInternal {
 
     pub async fn delete_job(&self, id: &JobId) -> Result<(), OxanaError> {
         let mut redis = self.connection().await?;
-        let envelope = self.get_job_w_conn(&mut redis, id).await?;
+        let raw_envelope: Option<String> = redis.hget(&self.keys.jobs, id).await?;
+        let queue = raw_envelope
+            .as_deref()
+            .and_then(|envelope| serde_json::from_str::<serde_json::Value>(envelope).ok())
+            .and_then(|envelope| {
+                envelope
+                    .get("queue")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        let queue_keys = if let Some(queue) = queue {
+            HashSet::from([self.namespace_queue(&queue)])
+        } else if raw_envelope.is_some() {
+            self.scan_keys_w_conn(&mut redis, &self.namespace_queue("*"))
+                .await?
+        } else {
+            HashSet::new()
+        };
         let mut pipe = redis::pipe();
         pipe.atomic()
             .hdel(&self.keys.jobs, id)
@@ -682,8 +699,8 @@ impl StorageInternal {
             .zrem(&self.keys.retry, id)
             .lrem(self.current_processing_queue(), 0, id);
 
-        if let Some(envelope) = envelope {
-            pipe.lrem(self.namespace_queue(&envelope.queue), 0, id);
+        for queue_key in queue_keys {
+            pipe.lrem(queue_key, 0, id);
         }
 
         let _: () = pipe.query_async(&mut redis).await?;
@@ -3225,6 +3242,36 @@ mod tests {
         assert!(returned_ids.contains(&envelope1.id));
         assert!(!returned_ids.contains(&envelope2.id));
         assert!(returned_ids.contains(&envelope3.id));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_job_cleans_up_corrupt_job_memberships() -> TestResult {
+        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let queue = random_string();
+        let envelope = JobEnvelope::new(queue.clone(), TestJob {})?;
+        let job_id = envelope.id.clone();
+
+        storage.enqueue(envelope).await?;
+
+        let mut redis = storage.connection().await?;
+        let _: () = redis::pipe()
+            .hset(&storage.keys.jobs, &job_id, "{invalid json")
+            .zadd(&storage.keys.schedule, &job_id, 1)
+            .zadd(&storage.keys.retry, &job_id, 1)
+            .lpush(storage.current_processing_queue(), &job_id)
+            .query_async(&mut redis)
+            .await?;
+
+        storage.delete_job(&job_id).await?;
+
+        let payload_exists: bool = redis.hexists(&storage.keys.jobs, &job_id).await?;
+        assert!(!payload_exists);
+        assert_eq!(storage.enqueued_count(&queue).await?, 0);
+        assert_eq!(storage.scheduled_count().await?, 0);
+        assert_eq!(storage.retries_count().await?, 0);
+        assert!(storage.currently_processing_job_ids().await?.is_empty());
 
         Ok(())
     }
