@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.2] - 2026-08-11
+
+### Added
+
+- Add `Storage::delete_unique_job` for deleting unique jobs by job ID or job value.
+
+### Fixed
+
+- Remove deleted jobs from pending, scheduled, retry, and processing queues so they can be re-enqueued cleanly.
+- Allow deleting jobs with corrupt payloads while cleaning up their queue memberships.
+
 ## [2.1.1] - 2026-08-06
 
 ### Changed

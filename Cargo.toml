@@ -7,5 +7,5 @@ default-members = ["oxana"]
 rust-version = "1.75"
 
 [workspace.dependencies]
-oxana = { version = "2.1.1", path = "oxana" }
-oxana-macros = { version = "=2.1.1", path = "oxana-macros" }
+oxana = { version = "2.1.2", path = "oxana" }
+oxana-macros = { version = "=2.1.2", path = "oxana-macros" }
