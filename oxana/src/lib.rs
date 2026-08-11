@@ -113,7 +113,9 @@ mod test_helper;
 pub use crate::context::JobContext;
 pub use crate::drainer::DrainStats;
 pub use crate::error::OxanaError;
-pub use crate::job_envelope::{JobConflictStrategy, JobData, JobEnvelope, JobId, JobMeta};
+pub use crate::job_envelope::{
+    JobConflictStrategy, JobData, JobEnvelope, JobId, JobMeta, UniqueJobId,
+};
 pub use crate::job_state::{JobProgress, JobProgressIterator, JobState};
 pub use crate::metrics::*;
 pub use crate::queue::{

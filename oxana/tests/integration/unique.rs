@@ -558,3 +558,61 @@ pub async fn test_unique_replace() -> TestResult {
 
     Ok(())
 }
+
+#[tokio::test]
+pub async fn test_delete_unique_job_accepts_job_id_or_job() -> TestResult {
+    let redis_pool = setup();
+    let storage = oxana::Storage::builder()
+        .namespace(random_string())
+        .build_from_pool(redis_pool)?;
+
+    let first_job_id = storage
+        .enqueue(
+            QueueOne,
+            WorkerUniqueSkipJob {
+                id: 1,
+                key: random_string(),
+                value: 1,
+            },
+        )
+        .await?;
+    storage.delete_unique_job(&first_job_id).await?;
+    assert!(storage.get_job(&first_job_id).await?.is_none());
+
+    let second_job_id = storage
+        .enqueue(
+            QueueOne,
+            WorkerUniqueSkipJob {
+                id: 2,
+                key: random_string(),
+                value: 2,
+            },
+        )
+        .await?;
+    let second_job = WorkerUniqueSkipJob {
+        id: 2,
+        key: random_string(),
+        value: 3,
+    };
+    storage.delete_unique_job(&second_job).await?;
+    assert!(storage.get_job(&second_job_id).await?.is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+pub async fn test_delete_unique_job_rejects_non_unique_job() -> TestResult {
+    let redis_pool = setup();
+    let storage = oxana::Storage::builder()
+        .namespace(random_string())
+        .build_from_pool(redis_pool)?;
+
+    let error = storage
+        .delete_unique_job(&WorkerNoopJob {})
+        .await
+        .expect_err("non-unique jobs cannot be resolved to a deterministic ID");
+
+    assert!(matches!(error, oxana::OxanaError::ConfigError(_)));
+
+    Ok(())
+}

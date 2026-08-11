@@ -7,7 +7,7 @@ use std::{
 use crate::{
     config::DEFAULT_DEAD_PROCESS_THRESHOLD,
     error::OxanaError,
-    job_envelope::{JobEnvelope, JobId},
+    job_envelope::{JobEnvelope, JobId, UniqueJobId},
     metrics::{
         JobMetricsDetail, JobMetricsQuery, JobMetricsSnapshot, MetricIdentity,
         QueueLengthMetricsSnapshot,
@@ -348,6 +348,19 @@ impl Storage {
     /// An [`OxanaError`] if the operation fails.
     pub async fn delete_job(&self, id: &JobId) -> Result<(), OxanaError> {
         self.internal.delete_job(id).await
+    }
+
+    /// Deletes a unique job identified by either its [`JobId`] or its [`Job`] value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OxanaError::ConfigError`] when the provided job does not define
+    /// a unique ID.
+    pub async fn delete_unique_job<T: UniqueJobId>(&self, job: &T) -> Result<(), OxanaError> {
+        let id = job.unique_job_id().ok_or_else(|| {
+            OxanaError::ConfigError("delete_unique_job requires a job with a unique ID".to_string())
+        })?;
+        self.delete_job(&id).await
     }
 
     /// Returns a job by its ID.
