@@ -7,6 +7,25 @@ use crate::worker::Job;
 
 pub type JobId = String;
 
+/// Resolves the deterministic ID used by a unique job.
+pub trait UniqueJobId {
+    /// Returns the job ID, or [`None`] when a [`Job`] does not define a unique ID.
+    fn unique_job_id(&self) -> Option<JobId>;
+}
+
+impl UniqueJobId for JobId {
+    fn unique_job_id(&self) -> Option<JobId> {
+        Some(self.clone())
+    }
+}
+
+impl<T: Job + 'static> UniqueJobId for T {
+    fn unique_job_id(&self) -> Option<JobId> {
+        self.unique_id()
+            .map(|unique_id| format!("{}/{}", T::name(), unique_id))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JobEnvelope {
     pub id: JobId,
@@ -58,13 +77,10 @@ pub enum JobConflictStrategy {
 impl JobEnvelope {
     pub(crate) fn new<T: Job + 'static>(queue: String, job: T) -> Result<Self, OxanaError> {
         let job_name = T::name().to_string();
-        let unique_id = job.unique_id();
-        let unique = unique_id.is_some();
+        let unique_job_id = job.unique_job_id();
+        let unique = unique_job_id.is_some();
         let resurrect = T::should_resurrect();
-        let id = match unique_id {
-            Some(id) => format!("{}/{}", job_name, id),
-            None => Uuid::new_v4().to_string(),
-        };
+        let id = unique_job_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         Ok(Self {
             id: id.clone(),
             queue,
@@ -115,8 +131,8 @@ impl JobEnvelope {
                 "{name}: cron jobs do not support `on_conflict = Replace`; use `Skip`"
             )));
         }
-        let (id, on_conflict, declared_unique) = match job.unique_id() {
-            Some(unique_id) => (format!("{name}/{unique_id}"), on_conflict, true),
+        let (id, on_conflict, declared_unique) = match job.unique_job_id() {
+            Some(unique_job_id) => (unique_job_id, on_conflict, true),
             None => (occurrence_id, JobConflictStrategy::Skip, false),
         };
         Ok((
