@@ -576,8 +576,10 @@ pub async fn test_delete_unique_job_accepts_job_id_or_job() -> TestResult {
             },
         )
         .await?;
+    assert_eq!(storage.enqueued_count(QueueOne).await?, 1);
     storage.delete_unique_job(&first_job_id).await?;
     assert!(storage.get_job(&first_job_id).await?.is_none());
+    assert_eq!(storage.enqueued_count(QueueOne).await?, 0);
 
     let second_job_id = storage
         .enqueue(
@@ -596,6 +598,97 @@ pub async fn test_delete_unique_job_accepts_job_id_or_job() -> TestResult {
     };
     storage.delete_unique_job(&second_job).await?;
     assert!(storage.get_job(&second_job_id).await?.is_none());
+    assert_eq!(storage.enqueued_count(QueueOne).await?, 0);
+
+    let re_enqueued_job_id = storage
+        .enqueue(
+            QueueOne,
+            WorkerUniqueSkipJob {
+                id: 2,
+                key: random_string(),
+                value: 4,
+            },
+        )
+        .await?;
+    assert_eq!(re_enqueued_job_id, second_job_id);
+    assert_eq!(storage.enqueued_count(QueueOne).await?, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+pub async fn test_delete_unique_job_removes_scheduled_membership() -> TestResult {
+    let redis_pool = setup();
+    let storage = oxana::Storage::builder()
+        .namespace(random_string())
+        .build_from_pool(redis_pool)?;
+
+    let job_id = storage
+        .enqueue_in(
+            QueueOne,
+            WorkerUniqueSkipJob {
+                id: 1,
+                key: random_string(),
+                value: 1,
+            },
+            60,
+        )
+        .await?;
+    assert_eq!(storage.scheduled_count().await?, 1);
+
+    storage.delete_unique_job(&job_id).await?;
+
+    assert!(storage.get_job(&job_id).await?.is_none());
+    assert_eq!(storage.scheduled_count().await?, 0);
+
+    let re_enqueued_job_id = storage
+        .enqueue_in(
+            QueueOne,
+            WorkerUniqueSkipJob {
+                id: 1,
+                key: random_string(),
+                value: 2,
+            },
+            60,
+        )
+        .await?;
+    assert_eq!(re_enqueued_job_id, job_id);
+    assert_eq!(storage.scheduled_count().await?, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+pub async fn test_delete_unique_job_removes_retry_membership() -> TestResult {
+    let redis_pool = setup();
+    let ctx = WorkerState {
+        redis: redis_pool.clone(),
+    };
+    let storage = oxana::Storage::builder()
+        .namespace(random_string())
+        .build_from_pool(redis_pool)?;
+    let runtime = storage
+        .runtime(ctx)
+        .queue::<QueueOne>()
+        .worker::<WorkerUniqueReplaceRetry, WorkerUniqueReplaceRetryJob>()
+        .exit_when_processed(1);
+
+    let job_id = storage
+        .enqueue(QueueOne, WorkerUniqueReplaceRetryJob { id: 1, marker: 1 })
+        .await?;
+    runtime.run().await?;
+    assert_eq!(storage.retries_count().await?, 1);
+
+    storage.delete_unique_job(&job_id).await?;
+
+    assert!(storage.get_job(&job_id).await?.is_none());
+    assert_eq!(storage.retries_count().await?, 0);
+
+    let re_enqueued_job_id = storage
+        .enqueue(QueueOne, WorkerUniqueReplaceRetryJob { id: 1, marker: 2 })
+        .await?;
+    assert_eq!(re_enqueued_job_id, job_id);
+    assert_eq!(storage.enqueued_count(QueueOne).await?, 1);
 
     Ok(())
 }

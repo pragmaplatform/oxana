@@ -674,11 +674,19 @@ impl StorageInternal {
 
     pub async fn delete_job(&self, id: &JobId) -> Result<(), OxanaError> {
         let mut redis = self.connection().await?;
-        let _: () = redis::pipe()
+        let envelope = self.get_job_w_conn(&mut redis, id).await?;
+        let mut pipe = redis::pipe();
+        pipe.atomic()
             .hdel(&self.keys.jobs, id)
-            .lrem(self.current_processing_queue(), 1, id)
-            .query_async(&mut redis)
-            .await?;
+            .zrem(&self.keys.schedule, id)
+            .zrem(&self.keys.retry, id)
+            .lrem(self.current_processing_queue(), 0, id);
+
+        if let Some(envelope) = envelope {
+            pipe.lrem(self.namespace_queue(&envelope.queue), 0, id);
+        }
+
+        let _: () = pipe.query_async(&mut redis).await?;
         Ok(())
     }
 
