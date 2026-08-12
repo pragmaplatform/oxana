@@ -128,6 +128,110 @@ impl oxana::FromContext<WorkerState> for WorkerUniqueReplaceRetry {
     }
 }
 
+#[tokio::test]
+pub async fn test_enqueue_at_unique_skip_preserves_original_schedule() -> TestResult {
+    let storage = oxana::Storage::builder()
+        .namespace(random_string())
+        .build_from_pool(setup())?;
+    let first_at = chrono::Utc::now() + chrono::Duration::seconds(60);
+    let between_at = first_at + chrono::Duration::seconds(30);
+    let second_at = first_at + chrono::Duration::seconds(60);
+    let key = random_string();
+
+    let first_id = storage
+        .enqueue_at(
+            QueueOne,
+            WorkerUniqueSkipJob {
+                id: 1,
+                key: key.clone(),
+                value: 1,
+            },
+            first_at,
+        )
+        .await?;
+    let skipped_id = storage
+        .enqueue_at(
+            QueueOne,
+            WorkerUniqueSkipJob {
+                id: 1,
+                key,
+                value: 2,
+            },
+            second_at,
+        )
+        .await?;
+    let between_id = storage
+        .enqueue_at(QueueOne, WorkerNoopJob {}, between_at)
+        .await?;
+
+    assert_eq!(skipped_id, first_id);
+    let scheduled = storage
+        .list_scheduled(&oxana::QueueListOpts {
+            count: 10,
+            offset: 0,
+        })
+        .await?;
+    assert_eq!(scheduled.len(), 2);
+    assert_eq!(scheduled[0].id, first_id);
+    assert_eq!(scheduled[0].meta.scheduled_at, first_at.timestamp_micros());
+    assert_eq!(scheduled[0].job.args["value"], 1);
+    assert_eq!(scheduled[1].id, between_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+pub async fn test_enqueue_at_unique_replace_uses_new_schedule() -> TestResult {
+    let storage = oxana::Storage::builder()
+        .namespace(random_string())
+        .build_from_pool(setup())?;
+    let first_at = chrono::Utc::now() + chrono::Duration::seconds(60);
+    let between_at = first_at + chrono::Duration::seconds(30);
+    let second_at = first_at + chrono::Duration::seconds(60);
+    let key = random_string();
+
+    let first_id = storage
+        .enqueue_at(
+            QueueOne,
+            WorkerUniqueReplaceJob {
+                id: 1,
+                key: key.clone(),
+                value: 1,
+            },
+            first_at,
+        )
+        .await?;
+    let replaced_id = storage
+        .enqueue_at(
+            QueueOne,
+            WorkerUniqueReplaceJob {
+                id: 1,
+                key,
+                value: 2,
+            },
+            second_at,
+        )
+        .await?;
+    let between_id = storage
+        .enqueue_at(QueueOne, WorkerNoopJob {}, between_at)
+        .await?;
+
+    assert_eq!(replaced_id, first_id);
+    let scheduled = storage
+        .list_scheduled(&oxana::QueueListOpts {
+            count: 10,
+            offset: 0,
+        })
+        .await?;
+    assert_eq!(scheduled.len(), 2);
+    assert_eq!(scheduled[0].id, between_id);
+    assert_eq!(scheduled[1].id, first_id);
+    assert_eq!(scheduled[1].meta.scheduled_at, second_at.timestamp_micros());
+    assert_eq!(scheduled[1].job.args["value"], 2);
+
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl oxana::Worker<WorkerUniqueReplaceRetryJob> for WorkerUniqueReplaceRetry {
     type Error = WorkerError;
