@@ -35,7 +35,7 @@ Oxana focuses on simplicity and depth over breadth - one backend, done well.
 ## Quick Start
 
 ```bash
-cargo add oxana@2.1.2 --features registry
+cargo add oxana@2.1.3 --features registry
 ```
 
 The `registry` feature (not enabled by default) powers `#[derive(oxana::Registry)]` and `runtime.register::<...>()` used below; without it, register queues and workers explicitly with `runtime.queue::<...>()` and `runtime.worker::<...>()`.
