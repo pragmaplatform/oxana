@@ -233,7 +233,7 @@ where
                 }
             }
 
-            let err_msg = e.to_string();
+            let err_msg = config.settings.format_error(e.as_ref());
             for (envelope, policy) in envelopes.iter().zip(policies.iter()) {
                 handle_err(
                     config,

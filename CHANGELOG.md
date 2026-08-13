@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Store worker errors using `Debug` formatting by default so captured backtraces appear on retry and dead jobs, and add `RuntimeBuilder::error_formatter` for applications that need a custom representation.
+
 ## [2.1.2] - 2026-08-11
 
 ### Added

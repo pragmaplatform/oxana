@@ -425,3 +425,39 @@ pub async fn test_retry_delay_override_receives_downcastable_error() -> TestResu
 
     Ok(())
 }
+
+#[tokio::test]
+pub async fn test_retry_uses_custom_error_formatter() -> TestResult {
+    let redis_pool = setup();
+    let ctx = WorkerState {
+        redis: redis_pool.clone(),
+    };
+
+    let storage = oxana::Storage::builder()
+        .namespace(random_string())
+        .build_from_pool(redis_pool)?;
+    let runtime = storage
+        .runtime(ctx)
+        .queue::<QueueOne>()
+        .worker::<WorkerAlwaysFail, WorkerAlwaysFailJob>()
+        .retry_delay_override(|_error, _retries, _default_delay| Some(60))
+        .error_formatter(|error| format!("diagnostic:\n{error:?}"))
+        .dequeue_timeout(Duration::from_millis(50))
+        .exit_when_processed(1);
+
+    storage.enqueue(QueueOne, WorkerAlwaysFailJob {}).await?;
+    runtime.run().await?;
+
+    let retries = storage
+        .list_retries(&oxana::QueueListOpts {
+            count: 1,
+            offset: 0,
+        })
+        .await?;
+    assert_eq!(
+        retries[0].meta.error.as_deref(),
+        Some("diagnostic:\nGeneric(\"always fails\")")
+    );
+
+    Ok(())
+}
