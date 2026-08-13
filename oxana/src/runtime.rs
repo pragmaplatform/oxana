@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Config, RetryDelayOverrideFn, RuntimeSettings};
+use crate::config::{Config, ErrorFormatterFn, RetryDelayOverrideFn, RuntimeSettings};
 use crate::context::ContextValue;
 use crate::drainer::{self, DrainStats};
 use crate::error::OxanaError;
@@ -144,6 +144,19 @@ where
         + 'static,
     ) -> Self {
         self.settings.retry_delay_override = Some(Arc::new(f) as Arc<RetryDelayOverrideFn>);
+        self
+    }
+
+    /// Sets a global formatter for worker errors before they are stored on retry or dead jobs.
+    ///
+    /// By default, errors use their [`std::fmt::Debug`] representation so error types that capture
+    /// backtraces can include them. The `'static` bound on
+    /// the error trait object allows `error.downcast_ref::<ConcreteError>()` inside the formatter.
+    pub fn error_formatter(
+        mut self,
+        f: impl Fn(&(dyn std::error::Error + Send + Sync + 'static)) -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.settings.error_formatter = Some(Arc::new(f) as Arc<ErrorFormatterFn>);
         self
     }
 

@@ -14,6 +14,8 @@ pub(crate) const DEFAULT_DEAD_PROCESS_THRESHOLD: Duration = Duration::from_secs(
 
 pub(crate) type RetryDelayOverrideFn =
     dyn Fn(&(dyn std::error::Error + Send + Sync + 'static), u32, u64) -> Option<u64> + Send + Sync;
+pub(crate) type ErrorFormatterFn =
+    dyn Fn(&(dyn std::error::Error + Send + Sync + 'static)) -> String + Send + Sync;
 
 type ShutdownSignal =
     Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send + Sync + 'static>>;
@@ -24,6 +26,7 @@ pub(crate) struct RuntimeSettings {
     shutdown_signal: Arc<Mutex<Option<ShutdownSignal>>>,
     pub(crate) shutdown_timeout: Duration,
     pub(crate) retry_delay_override: Option<Arc<RetryDelayOverrideFn>>,
+    pub(crate) error_formatter: Option<Arc<ErrorFormatterFn>>,
     pub(crate) heartbeat_interval: Duration,
     pub(crate) dead_process_threshold: Duration,
     pub(crate) resurrect_scan_interval: Duration,
@@ -45,6 +48,7 @@ impl RuntimeSettings {
             shutdown_signal: Arc::new(Mutex::new(Some(Box::pin(default_shutdown_signal())))),
             shutdown_timeout: Duration::from_secs(180),
             retry_delay_override: None,
+            error_formatter: None,
             heartbeat_interval: Duration::from_millis(500),
             dead_process_threshold: DEFAULT_DEAD_PROCESS_THRESHOLD,
             resurrect_scan_interval: Duration::from_secs(2),

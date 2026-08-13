@@ -219,8 +219,22 @@ Runtime configuration is done on the typed runtime builder, which allows you to:
 - Automatically register queues and workers via the component registry
 - Set up graceful shutdown
 - Configure exit conditions and runtime timing/backoff knobs
+- Customize how worker errors are stored on retry and dead jobs
 
 `Storage` remains the enqueueing and monitoring handle; `RuntimeBuilder<C>` is the worker setup and execution handle for app context type `C`.
+
+Worker errors use their `Debug` representation by default so error types that capture backtraces
+can include them in the dashboard. Applications can override the stored representation when needed:
+
+```rust
+let runtime = storage
+    .runtime(ctx)
+    .error_formatter(|error| error.to_string());
+```
+
+Backtraces must be enabled before the process starts (for example with `RUST_BACKTRACE=1`) and
+captured by the application's error type. Diagnostic output may contain sensitive details, so only
+enable backtraces where access to stored job errors is appropriately restricted.
 
 ### Error Handling
 
