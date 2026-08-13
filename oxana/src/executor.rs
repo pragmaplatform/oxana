@@ -233,11 +233,7 @@ where
                 }
             }
 
-            let err_msg = config
-                .settings
-                .error_formatter
-                .as_ref()
-                .map_or_else(|| format!("{e:?}"), |formatter| formatter(e.as_ref()));
+            let err_msg = config.settings.format_error(e.as_ref());
             for (envelope, policy) in envelopes.iter().zip(policies.iter()) {
                 handle_err(
                     config,

@@ -315,7 +315,14 @@ where
 
     /// Drains a queue of jobs using this runtime's registrations.
     pub async fn drain(&self, queue: impl Queue) -> Result<DrainStats, OxanaError> {
-        drainer::drain(&self.storage, &self.config, self.ctx.clone(), queue).await
+        drainer::drain(
+            &self.storage,
+            &self.config,
+            &self.settings,
+            self.ctx.clone(),
+            queue,
+        )
+        .await
     }
 
     #[cfg(test)]

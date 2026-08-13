@@ -81,6 +81,15 @@ impl RuntimeSettings {
             .take()
             .unwrap_or_else(no_signal)
     }
+
+    pub(crate) fn format_error(
+        &self,
+        error: &(dyn std::error::Error + Send + Sync + 'static),
+    ) -> String {
+        self.error_formatter
+            .as_ref()
+            .map_or_else(|| format!("{error:?}"), |formatter| formatter(error))
+    }
 }
 
 impl Default for RuntimeSettings {

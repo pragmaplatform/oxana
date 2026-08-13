@@ -1,5 +1,5 @@
 use crate::shared::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use testresult::TestResult;
 
 #[derive(Serialize)]
@@ -24,6 +24,31 @@ impl oxana::Queue for QueueDynamic {
 impl oxana::Queue for QueueStatic {
     fn to_config() -> oxana::QueueConfig {
         oxana::QueueConfig::as_static("static")
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DrainFailJob;
+
+impl oxana::Job for DrainFailJob {}
+
+struct DrainFailWorker;
+
+impl oxana::FromContext<()> for DrainFailWorker {
+    fn from_context(_ctx: &()) -> Self {
+        Self
+    }
+}
+
+#[async_trait::async_trait]
+impl oxana::Worker<DrainFailJob> for DrainFailWorker {
+    type Error = WorkerError;
+
+    async fn run_batch(
+        &self,
+        _jobs: Vec<oxana::BatchItem<DrainFailJob>>,
+    ) -> Result<(), WorkerError> {
+        Err(WorkerError::Generic("drain failed".to_string()))
     }
 }
 
@@ -84,6 +109,37 @@ pub async fn test_drain() -> TestResult {
     assert_eq!(storage.enqueued_count(QueueDynamic(2)).await?, 0);
     assert_eq!(storage.enqueued_count(QueueDynamic(3)).await?, 0);
     assert_eq!(storage.enqueued_count(QueueStatic).await?, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+pub async fn test_drain_uses_custom_error_formatter() -> TestResult {
+    let redis_pool = setup();
+    let storage = oxana::Storage::builder()
+        .namespace(random_string())
+        .build_from_pool(redis_pool)?;
+    let runtime = storage
+        .runtime(())
+        .queue::<QueueStatic>()
+        .worker::<DrainFailWorker, DrainFailJob>()
+        .error_formatter(|error| format!("diagnostic:\n{error:?}"));
+
+    storage.enqueue(QueueStatic, DrainFailJob).await?;
+
+    let stats = runtime.drain(QueueStatic).await?;
+    let dead = storage
+        .list_dead(&oxana::QueueListOpts {
+            count: 1,
+            offset: 0,
+        })
+        .await?;
+
+    assert_eq!(stats.failed, 1);
+    assert_eq!(
+        dead[0].meta.error.as_deref(),
+        Some("diagnostic:\nGeneric(\"drain failed\")")
+    );
 
     Ok(())
 }

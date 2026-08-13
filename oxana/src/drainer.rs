@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, RuntimeSettings};
 use crate::context::ContextValue;
 use crate::error::OxanaError;
 use crate::job_state::JobState;
@@ -28,6 +28,7 @@ pub struct DrainStats {
 ///
 /// * `storage` - The job storage to drain from
 /// * `config` - The worker configuration, including queue and worker registrations
+/// * `settings` - Runtime settings, including worker error formatting
 /// * `ctx` - The context value that will be shared across all worker instances
 /// * `queue` - The queue to drain
 ///
@@ -37,6 +38,7 @@ pub struct DrainStats {
 pub async fn drain<DT>(
     storage: &Storage,
     config: &Config<DT>,
+    settings: &RuntimeSettings,
     ctx: ContextValue<DT>,
     queue: impl Queue,
 ) -> Result<DrainStats, OxanaError>
@@ -47,7 +49,7 @@ where
     let mut stats = DrainStats::default();
 
     while let Some(job_id) = storage.internal.dequeue(&queue_key).await? {
-        let result = process_job(storage, config, ctx.clone(), job_id).await?;
+        let result = process_job(storage, config, settings, ctx.clone(), job_id).await?;
         match result {
             ProcessJobResult::Success => stats.succeeded += 1,
             ProcessJobResult::Failed => stats.failed += 1,
@@ -62,6 +64,7 @@ where
 async fn process_job<DT>(
     storage: &Storage,
     config: &Config<DT>,
+    settings: &RuntimeSettings,
     ctx: ContextValue<DT>,
     job_id: JobId,
 ) -> Result<ProcessJobResult, OxanaError>
@@ -98,7 +101,10 @@ where
         Err(e) => {
             tracing::error!("Job failed: {}", e);
             storage.internal.finish_with_failure(&envelope).await?;
-            storage.internal.kill(&envelope, e.to_string()).await?;
+            storage
+                .internal
+                .kill(&envelope, settings.format_error(e.as_ref()))
+                .await?;
             Ok(ProcessJobResult::Failed)
         }
     }
