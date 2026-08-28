@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::any::TypeId;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use crate::WorkerBatchConfig;
@@ -34,6 +35,7 @@ pub struct WorkerRegistry<DT> {
     aliases: HashMap<String, String>,
     pub schedules: HashMap<String, CronJob>,
     pub on_demand_jobs: HashMap<String, OnDemandJobRegistration>,
+    disabled_workers: HashSet<String>,
 }
 
 pub struct WorkerConfig<DT> {
@@ -141,6 +143,7 @@ struct WorkerFactories<DT> {
     batch_factory: JobBatchFactory<DT>,
     batch_config: Option<WorkerBatchConfig>,
     cron_envelope_factory: Option<CronEnvelopeFactory>,
+    groups: Vec<TypeId>,
 }
 
 impl<DT> WorkerRegistry<DT> {
@@ -150,6 +153,7 @@ impl<DT> WorkerRegistry<DT> {
             aliases: HashMap::new(),
             schedules: HashMap::new(),
             on_demand_jobs: HashMap::new(),
+            disabled_workers: HashSet::new(),
         }
     }
 
@@ -157,6 +161,7 @@ impl<DT> WorkerRegistry<DT> {
         &mut self,
         config: WorkerConfig<DT>,
         cron_envelope_factory: Option<CronEnvelopeFactory>,
+        groups: Vec<TypeId>,
     ) {
         assert!(
             cron_envelope_factory.is_some()
@@ -170,6 +175,7 @@ impl<DT> WorkerRegistry<DT> {
             batch_factory: config.batch_factory,
             batch_config: config.batch_config,
             cron_envelope_factory,
+            groups,
         };
 
         if let Some(alias_target) = self.aliases.remove(&name) {
@@ -228,7 +234,46 @@ impl<DT> WorkerRegistry<DT> {
     }
 
     pub fn worker_names(&self) -> Vec<&str> {
-        self.jobs.keys().map(|s| s.as_str()).collect()
+        self.jobs
+            .keys()
+            .filter(|name| !self.disabled_workers.contains(*name))
+            .map(String::as_str)
+            .collect()
+    }
+
+    pub(crate) fn apply_group_filters(
+        &mut self,
+        only_groups: &HashSet<TypeId>,
+        excluded_groups: &HashSet<TypeId>,
+    ) {
+        self.disabled_workers = self
+            .jobs
+            .iter()
+            .filter_map(|(name, factories)| {
+                let included = only_groups.is_empty()
+                    || factories
+                        .groups
+                        .iter()
+                        .any(|group| only_groups.contains(group));
+                let excluded = factories
+                    .groups
+                    .iter()
+                    .any(|group| excluded_groups.contains(group));
+
+                (!included || excluded).then(|| name.clone())
+            })
+            .collect();
+
+        for (alias, target) in &self.aliases {
+            if self.disabled_workers.contains(target) {
+                self.disabled_workers.insert(alias.clone());
+            }
+        }
+
+        self.schedules
+            .retain(|name, _| !self.disabled_workers.contains(name));
+        self.on_demand_jobs
+            .retain(|name, _| !self.disabled_workers.contains(name));
     }
 
     pub(crate) fn batch_config(&self, name: &str) -> Option<WorkerBatchConfig> {
@@ -322,7 +367,11 @@ impl<DT> WorkerRegistry<DT> {
 
     fn factories_for(&self, name: &str) -> Option<&WorkerFactories<DT>> {
         let canonical_name = self.resolve_name(name);
-        self.jobs.get(canonical_name)
+        if self.disabled_workers.contains(name) || self.disabled_workers.contains(canonical_name) {
+            None
+        } else {
+            self.jobs.get(canonical_name)
+        }
     }
 
     fn resolve_name<'a>(&'a self, name: &'a str) -> &'a str {

@@ -1,3 +1,5 @@
+use std::any::TypeId;
+
 use crate::{
     QueueConfig, WorkerConfigKind, context::JobContext, job_envelope::JobConflictStrategy,
 };
@@ -77,6 +79,14 @@ pub struct BatchItem<Args> {
 #[async_trait::async_trait]
 pub trait Worker<Args: Send + 'static>: Send + Sync {
     type Error: IntoWorkerError + Send + Sync + 'static;
+
+    #[doc(hidden)]
+    fn groups() -> Vec<TypeId>
+    where
+        Self: Sized,
+    {
+        Vec::new()
+    }
 
     async fn process(&self, job: Args, ctx: &JobContext) -> Result<(), Self::Error> {
         self.run_batch(vec![BatchItem {
@@ -682,6 +692,41 @@ mod tests {
             batch_config.timeout(),
             std::time::Duration::from_millis(150)
         );
+    }
+
+    #[test]
+    fn worker_macro_supports_multiple_groups() {
+        #[derive(oxana::WorkerGroup)]
+        struct ProductionCron;
+
+        #[derive(oxana::WorkerGroup)]
+        struct ProductionOnly;
+
+        #[derive(Debug, Serialize, Deserialize, oxana::Job)]
+        struct GroupedJob;
+
+        #[derive(oxana::Worker)]
+        #[oxana(group = ProductionCron)]
+        #[oxana(group = ProductionOnly)]
+        struct GroupedWorker;
+
+        impl GroupedWorker {
+            async fn process(
+                &self,
+                _job: GroupedJob,
+                _ctx: &oxana::JobContext,
+            ) -> Result<(), WorkerError> {
+                Ok(())
+            }
+        }
+
+        let groups = <GroupedWorker as oxana::Worker<GroupedJob>>::groups();
+        assert_eq!(groups.len(), 2);
+        assert!(groups.contains(&oxana::worker_group_id::<ProductionCron>()));
+        assert!(groups.contains(&oxana::worker_group_id::<ProductionOnly>()));
+
+        let filter_groups = oxana::WorkerGroups::group_ids((ProductionCron, ProductionOnly));
+        assert_eq!(filter_groups.len(), 2);
     }
 
     #[tokio::test]

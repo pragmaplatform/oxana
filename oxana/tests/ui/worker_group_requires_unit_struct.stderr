@@ -1,0 +1,5 @@
+error: WorkerGroup must be a unit struct.
+ --> tests/ui/worker_group_requires_unit_struct.rs:2:8
+  |
+2 | struct InvalidGroup {
+  |        ^^^^^^^^^^^^

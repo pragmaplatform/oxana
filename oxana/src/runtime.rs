@@ -1,3 +1,5 @@
+use std::any::TypeId;
+use std::collections::HashSet;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +15,7 @@ use crate::result_collector::Stats as RunStats;
 use crate::storage::Storage;
 use crate::storage_types::Catalog;
 use crate::worker::{FromContext, Job, Worker};
+use crate::worker_group::WorkerGroups;
 
 #[cfg(feature = "registry")]
 use crate::registry::RegisterComponents;
@@ -25,6 +28,8 @@ where
     config: Config<DT>,
     settings: RuntimeSettings,
     ctx: ContextValue<DT>,
+    only_groups: HashSet<TypeId>,
+    excluded_groups: HashSet<TypeId>,
 }
 
 impl<DT> RuntimeBuilder<DT>
@@ -37,6 +42,8 @@ where
             config: Config::new(),
             settings: RuntimeSettings::new(),
             ctx: ContextValue::new(ctx),
+            only_groups: HashSet::new(),
+            excluded_groups: HashSet::new(),
         }
     }
 
@@ -97,6 +104,28 @@ where
     /// Registers a worker from a [`crate::WorkerConfig`].
     pub fn worker_with(mut self, worker: crate::WorkerConfig<DT>) -> Self {
         self.config.register_worker_with(worker);
+        self
+    }
+
+    /// Runs only workers belonging to at least one of the supplied groups.
+    ///
+    /// Calls accumulate, and ungrouped workers are excluded when this filter is present.
+    pub fn only_groups<G>(mut self, groups: G) -> Self
+    where
+        G: WorkerGroups,
+    {
+        self.only_groups.extend(groups.group_ids());
+        self
+    }
+
+    /// Excludes workers belonging to any of the supplied groups.
+    ///
+    /// Calls accumulate, and ungrouped workers remain enabled.
+    pub fn exclude_groups<G>(mut self, groups: G) -> Self
+    where
+        G: WorkerGroups,
+    {
+        self.excluded_groups.extend(groups.group_ids());
         self
     }
 
@@ -300,7 +329,7 @@ where
     }
 
     /// Runs the Oxana worker system.
-    pub async fn run(self) -> Result<RunStats, OxanaError> {
+    pub async fn run(mut self) -> Result<RunStats, OxanaError> {
         if self.settings.dead_process_threshold <= self.settings.heartbeat_interval {
             tracing::warn!(
                 dead_process_threshold_ms = self.settings.dead_process_threshold.as_millis(),
@@ -309,6 +338,13 @@ where
                  live processes may be treated as dead and their in-flight jobs \
                  re-enqueued while still running"
             );
+        }
+        self.config
+            .apply_group_filters(&self.only_groups, &self.excluded_groups);
+        if self.config.registry.worker_names().is_empty() {
+            return Err(OxanaError::ConfigError(
+                "no workers are enabled for this runtime".to_string(),
+            ));
         }
         crate::launcher::run(self.storage, self.config, self.settings, self.ctx).await
     }

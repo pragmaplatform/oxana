@@ -16,6 +16,8 @@ struct OxanaArgs {
     batch_size: Option<usize>,
     batch_timeout_ms: Option<u64>,
     cron: Option<Cron>,
+    #[darling(default, multiple)]
+    group: Vec<Path>,
 }
 
 #[derive(Debug)]
@@ -144,6 +146,7 @@ fn expand_worker_impl(
     };
 
     let batch_config = expand_batch_config(struct_ident, args);
+    let groups = &args.group;
     let process = if batch_config.is_some() {
         quote! {
             async fn process(&self, job: #type_args, ctx: &oxana::JobContext) -> Result<(), Self::Error> {
@@ -173,6 +176,10 @@ fn expand_worker_impl(
         #[async_trait::async_trait]
         impl oxana::Worker<#type_args> for #struct_ident {
             type Error = #type_error;
+
+            fn groups() -> Vec<std::any::TypeId> {
+                vec![#(oxana::worker_group_id::<#groups>()),*]
+            }
 
             #process
 

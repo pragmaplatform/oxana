@@ -140,6 +140,7 @@ Jobs carry the data that gets enqueued and define enqueue-time metadata. Workers
 | `#[oxana(resume = false)]` - reset prior-attempt job state on retry | `#[oxana(registry = MyRegistry)]` - choose component registry |
 | `#[oxana(throttle_cost = 2)]` - set per-job throttle cost | `#[oxana(max_retries = 3)]` - set maximum retry attempts |
 | `#[oxana(on_demand)]` - expose the job in the web dashboard for manual enqueueing | `#[oxana(retry_delay = 5)]` - set retry delay in seconds |
+|  | `#[oxana(group = MyGroup)]` - assign the worker to a typed worker group (repeatable) |
 |  | `#[oxana(cron(schedule = "*/5 * * * * *", queue = MyQueue))]` - schedule periodic jobs |
 |  | `#[oxana(batch_size = 100, batch_timeout_ms = 500)]` - process jobs in batches |
 
@@ -152,6 +153,42 @@ For job hooks, `Self::...` resolves to the job type. For worker hooks, `Self::..
 On-demand argument templates infer editable placeholders from field types. Numeric primitives and common numeric ID newtypes named `*Id` or `*ID` are prefilled with `0`.
 
 Batch workers use all-or-nothing result semantics: if `process_batch` returns `Ok(())`, every job in the batch is marked successful; if it returns an error or panics, every job in that batch follows the normal retry or failure path. Batch handlers should therefore be idempotent, or should only commit external side effects after the whole batch is ready to succeed.
+
+### Worker Groups
+
+Worker groups let different Oxana processes run selected subsets of the registered workers. Groups
+are typed unit structs, and a worker may belong to more than one group:
+
+```rust
+#[derive(oxana::WorkerGroup)]
+pub struct ProductionCron;
+
+#[derive(oxana::WorkerGroup)]
+pub struct ProductionOnly;
+
+#[derive(oxana::Worker)]
+#[oxana(group = ProductionCron)]
+#[oxana(group = ProductionOnly)]
+pub struct ReportWorker;
+```
+
+Apply group filters when building the runtime:
+
+```rust
+storage
+    .runtime(ctx)
+    .register::<ComponentRegistry>()
+    .only_groups((ProductionCron, ProductionOnly))
+    .exclude_groups(Maintenance)
+    .run()
+    .await?;
+```
+
+Repeated filter calls accumulate. An `only_groups` filter enables workers that belong to at least
+one included group and disables ungrouped workers. An `exclude_groups` filter disables workers that
+belong to any excluded group while leaving ungrouped workers enabled. If both filters are used, both
+conditions apply. Startup returns a configuration error if no workers remain enabled. Jobs for
+disabled workers must be routed to queues that this runtime does not poll.
 
 ### Queues
 

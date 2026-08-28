@@ -2,11 +2,13 @@ mod job;
 mod queue;
 mod registry;
 mod worker;
+mod worker_group;
 
 use job::*;
 use queue::*;
 use registry::*;
 use worker::*;
+use worker_group::*;
 
 use proc_macro::TokenStream;
 use proc_macro_error2::proc_macro_error;
@@ -76,6 +78,17 @@ pub fn derive_worker(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
     expand_derive_worker(input).into()
+}
+
+/// Generates an implementation of the `oxana::WorkerGroup` marker trait.
+///
+/// Worker groups must be unit structs.
+#[proc_macro_error]
+#[proc_macro_derive(WorkerGroup)]
+pub fn derive_worker_group(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+
+    expand_derive_worker_group(input).into()
 }
 
 /// Helper to define a component registry.

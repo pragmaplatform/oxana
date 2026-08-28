@@ -6,6 +6,7 @@ fn worker_macro_validation_errors() {
     t.compile_fail("tests/ui/batch_timeout_requires_size.rs");
     t.compile_fail("tests/ui/cron_replace_conflict.rs");
     t.compile_fail("tests/ui/static_queue_discovery_interval.rs");
+    t.compile_fail("tests/ui/worker_group_requires_unit_struct.rs");
 }
 
 #[test]

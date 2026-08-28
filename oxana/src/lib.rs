@@ -99,6 +99,7 @@ mod storage_types;
 mod throttler;
 mod worker;
 mod worker_event;
+mod worker_group;
 mod worker_registry;
 
 #[cfg(feature = "registry")]
@@ -131,6 +132,7 @@ pub use crate::storage_types::*;
 pub use crate::worker::{
     BatchItem, BoxError, FromContext, IntoWorkerError, Job, Worker, WorkerBatchConfig,
 };
+pub use crate::worker_group::{WorkerGroup, WorkerGroups, worker_group_id};
 pub use crate::worker_registry::{
     OnDemandJobRegistration, WorkerConfig, WorkerConfigKind, job_batch_factory,
     job_envelope_factory, job_factory,
@@ -140,4 +142,4 @@ pub use crate::worker_registry::{
 pub use registry::*;
 
 #[cfg(feature = "macros")]
-pub use oxana_macros::{Job, Queue, Registry, Worker};
+pub use oxana_macros::{Job, Queue, Registry, Worker, WorkerGroup};

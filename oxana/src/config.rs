@@ -174,13 +174,23 @@ impl<DT> Config<DT> {
                 kind,
             },
             Some(worker_registry::cron_envelope_factory::<A>),
+            W::groups(),
         );
         self
     }
 
     /// Registers a worker from a [`WorkerConfig`].
     pub fn register_worker_with(&mut self, config: WorkerConfig<DT>) {
-        self.registry.register_worker_with(config, None);
+        self.registry.register_worker_with(config, None, Vec::new());
+    }
+
+    pub(crate) fn apply_group_filters(
+        &mut self,
+        only_groups: &HashSet<std::any::TypeId>,
+        excluded_groups: &HashSet<std::any::TypeId>,
+    ) {
+        self.registry
+            .apply_group_filters(only_groups, excluded_groups);
     }
 
     /// Returns a catalog of all registered workers.
@@ -295,6 +305,12 @@ mod tests {
 
     macro_rules! impl_test_worker {
         ($worker:ty, $job:ty) => {
+            impl_test_worker!(@impl $worker, $job, []);
+        };
+        ($worker:ty, $job:ty, $($group:ty),+ $(,)?) => {
+            impl_test_worker!(@impl $worker, $job, [$($group),+]);
+        };
+        (@impl $worker:ty, $job:ty, [$($group:ty),*]) => {
             impl oxana::FromContext<()> for $worker {
                 fn from_context(_ctx: &()) -> Self {
                     Self
@@ -305,6 +321,10 @@ mod tests {
             impl oxana::Worker<$job> for $worker {
                 type Error = WorkerError;
 
+                fn groups() -> Vec<std::any::TypeId> {
+                    vec![$(oxana::worker_group_id::<$group>()),*]
+                }
+
                 async fn run_batch(
                     &self,
                     _jobs: Vec<oxana::BatchItem<$job>>,
@@ -314,6 +334,12 @@ mod tests {
             }
         };
     }
+
+    struct GroupA;
+    impl oxana::WorkerGroup for GroupA {}
+
+    struct GroupB;
+    impl oxana::WorkerGroup for GroupB {}
 
     #[derive(Debug, Serialize, Deserialize)]
     struct PlainJob {
@@ -341,7 +367,7 @@ mod tests {
         }
     }
 
-    impl_test_worker!(ZetaWorker, ZetaJob);
+    impl_test_worker!(ZetaWorker, ZetaJob, GroupA);
 
     #[derive(Debug, Serialize, Deserialize)]
     struct AlphaJob {
@@ -378,7 +404,55 @@ mod tests {
         }
     }
 
-    impl_test_worker!(AlphaWorker, AlphaJob);
+    impl_test_worker!(AlphaWorker, AlphaJob, GroupA, GroupB);
+
+    fn grouped_config() -> Config<()> {
+        Config::<()>::new()
+            .register_worker::<PlainWorker, PlainJob>()
+            .register_worker::<ZetaWorker, ZetaJob>()
+            .register_worker::<AlphaWorker, AlphaJob>()
+    }
+
+    fn worker_names(config: &Config<()>) -> Vec<String> {
+        let mut names = config
+            .registry
+            .worker_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn group_filters_include_exclude_and_preserve_ungrouped_semantics() {
+        let group_a = HashSet::from([oxana::worker_group_id::<GroupA>()]);
+        let group_b = HashSet::from([oxana::worker_group_id::<GroupB>()]);
+        let no_groups = HashSet::new();
+
+        let mut only_a = grouped_config();
+        only_a.apply_group_filters(&group_a, &no_groups);
+        assert_eq!(
+            worker_names(&only_a),
+            vec![AlphaJob::name().to_string(), ZetaJob::name().to_string()]
+        );
+        let mut exclude_a = grouped_config();
+        exclude_a.apply_group_filters(&no_groups, &group_a);
+        assert_eq!(worker_names(&exclude_a), vec![PlainJob::name().to_string()]);
+
+        let mut only_a_or_b_excluding_b = grouped_config();
+        only_a_or_b_excluding_b.apply_group_filters(
+            &HashSet::from([
+                oxana::worker_group_id::<GroupA>(),
+                oxana::worker_group_id::<GroupB>(),
+            ]),
+            &group_b,
+        );
+        assert_eq!(
+            worker_names(&only_a_or_b_excluding_b),
+            vec![ZetaJob::name().to_string()]
+        );
+    }
 
     #[test]
     #[should_panic(expected = "manual cron worker registration is not supported")]
