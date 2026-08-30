@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::failure::{ExecutionSentryHub, FailureReporterFn, WorkerFailureReport, report_failure};
 use crate::queue::QueueConfig;
 use crate::storage_types::{
     Catalog, CronWorkerInfo, OnDemandJobInfo, QueueInfo, QueueThrottleInfo, WorkerInfo,
@@ -27,6 +28,7 @@ pub(crate) struct RuntimeSettings {
     pub(crate) shutdown_timeout: Duration,
     pub(crate) retry_delay_override: Option<Arc<RetryDelayOverrideFn>>,
     pub(crate) error_formatter: Option<Arc<ErrorFormatterFn>>,
+    pub(crate) failure_reporter: Option<Arc<FailureReporterFn>>,
     pub(crate) heartbeat_interval: Duration,
     pub(crate) dead_process_threshold: Duration,
     pub(crate) resurrect_scan_interval: Duration,
@@ -50,6 +52,7 @@ impl RuntimeSettings {
             shutdown_timeout: Duration::from_secs(180),
             retry_delay_override: None,
             error_formatter: None,
+            failure_reporter: None,
             heartbeat_interval: Duration::from_millis(500),
             dead_process_threshold: DEFAULT_DEAD_PROCESS_THRESHOLD,
             resurrect_scan_interval: Duration::from_secs(2),
@@ -103,6 +106,14 @@ impl RuntimeSettings {
         self.error_formatter
             .as_ref()
             .map_or_else(|| format!("{error:?}"), |formatter| formatter(error))
+    }
+
+    pub(crate) fn report_failure(
+        &self,
+        report: WorkerFailureReport<'_>,
+        execution_hub: &ExecutionSentryHub,
+    ) {
+        report_failure(self.failure_reporter.as_ref(), report, execution_hub);
     }
 }
 
