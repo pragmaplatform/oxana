@@ -15,7 +15,7 @@ test = true
 
 [features]
 default = ["sentry", "tracing-instrument", "macros"]
-sentry = ["sentry-core"]
+sentry = ["sentry-core/client"]
 tracing-instrument = []
 macros = ["oxana-macros"]
 registry = ["inventory", "oxana-macros?/registry"]
@@ -45,6 +45,8 @@ oxana-macros = { workspace = true, optional = true }
 divan = "^0.1"
 dotenvy = "^0.15"
 rand = "^0.10"
+sentry-core = { version = "=0.48.5", features = ["test"] }
+sentry-panic = "=0.48.5"
 testresult = "^0.4"
 tracing-subscriber = { version = "^0.3", features = ["env-filter"] }
 trybuild = "1.0"

@@ -81,6 +81,7 @@ mod dispatcher;
 mod drainer;
 mod error;
 mod executor;
+mod failure;
 mod job_envelope;
 mod job_state;
 mod launcher;
@@ -112,6 +113,9 @@ mod test_helper;
 pub use crate::context::JobContext;
 pub use crate::drainer::DrainStats;
 pub use crate::error::OxanaError;
+pub use crate::failure::{
+    FailedJobMetadata, WorkerFailure, WorkerFailureMetadata, WorkerFailureReport,
+};
 pub use crate::job_envelope::{
     JobConflictStrategy, JobData, JobEnvelope, JobId, JobMeta, UniqueJobId,
 };

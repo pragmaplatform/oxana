@@ -6,12 +6,20 @@ use crate::job_envelope::JobEnvelope;
 use crate::job_state::JobState;
 use crate::runtime::Runtime;
 use crate::worker::{BoxedProcessable, WorkerError};
-use crate::{JobContext, OxanaError};
+use crate::{
+    FailedJobMetadata, JobContext, OxanaError, WorkerFailure, WorkerFailureMetadata,
+    WorkerFailureReport,
+};
 
 #[derive(Debug)]
 enum ExecutionResult {
     NotPanic(Result<(), WorkerError>),
     Panic(String),
+}
+
+struct ProcessResult {
+    result: ExecutionResult,
+    sentry_hub: crate::failure::ExecutionSentryHub,
 }
 
 pub(crate) enum ExecutionError {
@@ -90,7 +98,6 @@ where
         job: worker.job_name(),
         worker: worker.worker_name(),
     };
-
     if envelopes.len() == 1 {
         tracing::info!(
             job_id = first_envelope.id,
@@ -112,11 +119,11 @@ where
     let start = std::time::Instant::now();
     let job_contexts = job_contexts(&config.storage, envelopes);
 
-    let result = run_process(worker, job_contexts, first_envelope).await;
+    let process_result = run_process(worker, job_contexts, first_envelope).await;
 
     let duration = start.elapsed();
     let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-    let is_err = !matches!(result, ExecutionResult::NotPanic(Ok(_)));
+    let is_err = !matches!(process_result.result, ExecutionResult::NotPanic(Ok(_)));
     if envelopes.len() == 1 {
         tracing::info!(
             job_id = first_envelope.id,
@@ -140,7 +147,8 @@ where
         );
     }
 
-    let result = finish_batch_result(config.as_ref(), result, envelopes, &policies, names).await;
+    let result =
+        finish_batch_result(config.as_ref(), process_result, envelopes, &policies, names).await;
     Ok(ExecutionOutcome {
         result,
         duration_ms,
@@ -167,14 +175,14 @@ async fn run_process(
     worker: BoxedProcessable,
     job_contexts: Vec<JobContext>,
     envelope: &JobEnvelope,
-) -> ExecutionResult {
-    match AssertUnwindSafe(process(worker, job_contexts, envelope))
-        .catch_unwind()
-        .await
-    {
+) -> ProcessResult {
+    let future = AssertUnwindSafe(process(worker, job_contexts, envelope)).catch_unwind();
+    let (result, sentry_hub) = crate::failure::with_execution_sentry_hub(future).await;
+    let result = match result {
         Ok(result) => ExecutionResult::NotPanic(result),
         Err(panic) => ExecutionResult::Panic(panic_message(panic)),
-    }
+    };
+    ProcessResult { result, sentry_hub }
 }
 
 fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
@@ -189,7 +197,7 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
 
 async fn finish_batch_result<DT>(
     config: &Runtime<DT>,
-    result: ExecutionResult,
+    process_result: ProcessResult,
     envelopes: &[JobEnvelope],
     policies: &[JobExecutionPolicy],
     names: ExecutionNames,
@@ -197,6 +205,7 @@ async fn finish_batch_result<DT>(
 where
     DT: Send + Sync + Clone + 'static,
 {
+    let ProcessResult { result, sentry_hub } = process_result;
     match result {
         ExecutionResult::NotPanic(Ok(())) => {
             if let Err(e) = config
@@ -210,8 +219,14 @@ where
             Ok(())
         }
         ExecutionResult::NotPanic(Err(e)) => {
-            #[cfg(feature = "sentry")]
-            sentry_core::capture_error(e.as_ref());
+            let failure_metadata = failure_metadata(envelopes, policies, names);
+            config.settings.report_failure(
+                WorkerFailureReport {
+                    failure: WorkerFailure::Error(e.as_ref()),
+                    metadata: &failure_metadata,
+                },
+                &sentry_hub,
+            );
 
             if let Some(envelope) = envelopes.first() {
                 if envelopes.len() == 1 {
@@ -248,8 +263,16 @@ where
             Err(ExecutionError::NotPanic)
         }
         ExecutionResult::Panic(panic_msg) => {
-            #[cfg(feature = "sentry")]
-            sentry_core::capture_message(&panic_msg, sentry_core::Level::Error);
+            let failure_metadata = failure_metadata(envelopes, policies, names);
+            config.settings.report_failure(
+                WorkerFailureReport {
+                    failure: WorkerFailure::Panic {
+                        message: &panic_msg,
+                    },
+                    metadata: &failure_metadata,
+                },
+                &sentry_hub,
+            );
 
             for (envelope, policy) in envelopes.iter().zip(policies.iter()) {
                 handle_err(
@@ -264,6 +287,38 @@ where
 
             Err(ExecutionError::Panic())
         }
+    }
+}
+
+fn failure_metadata(
+    envelopes: &[JobEnvelope],
+    policies: &[JobExecutionPolicy],
+    names: ExecutionNames,
+) -> WorkerFailureMetadata {
+    let jobs = envelopes
+        .iter()
+        .zip(policies)
+        .map(|(envelope, policy)| {
+            let will_retry = envelope.meta.retries < policy.max_retries;
+            FailedJobMetadata {
+                job_id: envelope.id.clone(),
+                args: envelope.job.args.clone(),
+                retry_count: envelope.meta.retries,
+                max_retries: policy.max_retries,
+                will_retry,
+            }
+        })
+        .collect::<Vec<_>>();
+    let will_retry = jobs.iter().any(|job| job.will_retry);
+
+    WorkerFailureMetadata {
+        jobs,
+        queue: envelopes
+            .first()
+            .map_or_else(String::new, |envelope| envelope.queue.clone()),
+        job_name: names.job.to_string(),
+        worker_name: names.worker.to_string(),
+        will_retry,
     }
 }
 
