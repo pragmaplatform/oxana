@@ -8,7 +8,7 @@ use crate::config::{Config, ErrorFormatterFn, RetryDelayOverrideFn, RuntimeSetti
 use crate::context::ContextValue;
 use crate::drainer::{self, DrainStats};
 use crate::error::OxanaError;
-use crate::queue::{Queue, QueueConcurrency, require_non_zero_duration};
+use crate::queue::{Queue, QueueConcurrency, QueueConfig, require_non_zero_duration};
 use crate::result_collector::Stats as RunStats;
 use crate::storage::Storage;
 use crate::storage_types::Catalog;
@@ -82,6 +82,23 @@ where
         let mut config = Q::to_config();
         config.concurrency = QueueConcurrency::Fixed(concurrency);
         self.queue_with(config)
+    }
+
+    /// Restricts this runtime to processing the specified queue.
+    ///
+    /// This method can be called multiple times to allow multiple queues. If it
+    /// is never called, the runtime processes every registered queue. Selecting
+    /// a dynamic queue includes all of its discovered subqueues.
+    ///
+    /// The selected queue must also be registered before [`Self::run`] is
+    /// called, either explicitly or through a component registry or cron
+    /// worker.
+    pub fn only_queue<Q>(mut self) -> Self
+    where
+        Q: Queue,
+    {
+        self.settings.queue_allowlist.insert(Q::to_config());
+        self
     }
 
     /// Registers a worker for a job type.
@@ -301,6 +318,20 @@ where
 
     /// Runs the Oxana worker system.
     pub async fn run(self) -> Result<RunStats, OxanaError> {
+        let mut missing_queues: Vec<String> = self
+            .settings
+            .queue_allowlist
+            .difference(&self.config.queues)
+            .map(QueueConfig::key_or_prefix)
+            .collect();
+        if !missing_queues.is_empty() {
+            missing_queues.sort();
+            return Err(OxanaError::ConfigError(format!(
+                "Selected queues are not registered: {}",
+                missing_queues.join(", ")
+            )));
+        }
+
         if self.settings.dead_process_threshold <= self.settings.heartbeat_interval {
             tracing::warn!(
                 dead_process_threshold_ms = self.settings.dead_process_threshold.as_millis(),
@@ -354,5 +385,114 @@ impl<DT> Deref for Runtime<DT> {
 
     fn deref(&self) -> &Self::Target {
         &self.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::QueueKind;
+
+    struct QueueOne;
+
+    impl Queue for QueueOne {
+        fn to_config() -> QueueConfig {
+            QueueConfig::as_static("one")
+        }
+    }
+
+    struct QueueTwo;
+
+    impl Queue for QueueTwo {
+        fn to_config() -> QueueConfig {
+            QueueConfig::as_static("two")
+        }
+    }
+
+    struct DynamicQueue;
+
+    impl Queue for DynamicQueue {
+        fn to_config() -> QueueConfig {
+            QueueConfig::as_dynamic("dynamic")
+        }
+    }
+
+    fn test_storage() -> Storage {
+        Storage::builder()
+            .build_from_redis_url("redis://127.0.0.1/0")
+            .expect("test storage should build")
+    }
+
+    #[test]
+    fn only_queue_builds_an_allowlist_without_changing_the_catalog() {
+        let runtime = test_storage()
+            .runtime(())
+            .queue::<QueueOne>()
+            .queue::<QueueTwo>()
+            .queue::<DynamicQueue>()
+            .only_queue::<QueueOne>()
+            .only_queue::<DynamicQueue>();
+
+        assert!(runtime.settings.runs_queue(&QueueOne::to_config()));
+        assert!(!runtime.settings.runs_queue(&QueueTwo::to_config()));
+        assert!(runtime.settings.runs_queue(&DynamicQueue::to_config()));
+        assert!(runtime.settings.runs_static_queue("one"));
+        assert!(!runtime.settings.runs_static_queue("two"));
+
+        let catalog = runtime.catalog();
+        assert_eq!(catalog.queues.len(), 3);
+        assert!(catalog.queues.iter().any(|queue| queue.key == "one"));
+        assert!(catalog.queues.iter().any(|queue| queue.key == "two"));
+        assert!(
+            catalog
+                .queues
+                .iter()
+                .any(|queue| queue.key == "dynamic" && queue.dynamic)
+        );
+    }
+
+    #[test]
+    fn runtime_runs_all_queues_without_an_allowlist() {
+        let runtime = test_storage()
+            .runtime(())
+            .queue::<QueueOne>()
+            .queue::<DynamicQueue>();
+
+        assert!(runtime.settings.runs_queue(&QueueOne::to_config()));
+        assert!(runtime.settings.runs_queue(&DynamicQueue::to_config()));
+        assert!(runtime.settings.runs_static_queue("any-static-queue"));
+    }
+
+    #[tokio::test]
+    async fn run_rejects_an_unregistered_selected_queue() {
+        let result = test_storage()
+            .runtime(())
+            .only_queue::<QueueTwo>()
+            .run()
+            .await;
+
+        match result {
+            Err(OxanaError::ConfigError(message)) => {
+                assert_eq!(message, "Selected queues are not registered: two");
+            }
+            _ => panic!("expected an unregistered queue configuration error"),
+        }
+    }
+
+    #[test]
+    fn dynamic_queue_selection_matches_the_parent_configuration() {
+        let runtime = test_storage()
+            .runtime(())
+            .queue::<DynamicQueue>()
+            .only_queue::<DynamicQueue>();
+        let selected = runtime
+            .settings
+            .queue_allowlist
+            .iter()
+            .next()
+            .expect("dynamic queue should be selected");
+
+        assert!(matches!(selected.kind, QueueKind::Dynamic { .. }));
+        assert!(runtime.settings.runs_queue(&DynamicQueue::to_config()));
     }
 }

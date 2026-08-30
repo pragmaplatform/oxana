@@ -39,6 +39,7 @@ pub(crate) struct RuntimeSettings {
     pub(crate) dequeue_timeout: Duration,
     pub(crate) dispatcher_idle_sleep: Duration,
     pub(crate) throttled_queue_fallback_wait: Duration,
+    pub(crate) queue_allowlist: HashSet<QueueConfig>,
 }
 
 impl RuntimeSettings {
@@ -61,7 +62,20 @@ impl RuntimeSettings {
             dequeue_timeout: Duration::from_secs(10),
             dispatcher_idle_sleep: Duration::from_secs(1),
             throttled_queue_fallback_wait: Duration::from_millis(100),
+            queue_allowlist: HashSet::new(),
         }
+    }
+
+    pub(crate) fn runs_queue(&self, queue: &QueueConfig) -> bool {
+        self.queue_allowlist.is_empty() || self.queue_allowlist.contains(queue)
+    }
+
+    pub(crate) fn runs_static_queue(&self, queue_key: &str) -> bool {
+        self.queue_allowlist.is_empty()
+            || self
+                .queue_allowlist
+                .iter()
+                .any(|queue| queue.static_key().as_deref() == Some(queue_key))
     }
 
     pub(crate) fn replace_shutdown_signal(

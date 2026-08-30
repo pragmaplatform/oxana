@@ -221,6 +221,23 @@ Runtime configuration is done on the typed runtime builder, which allows you to:
 - Configure exit conditions and runtime timing/backoff knobs
 - Customize how worker errors are stored on retry and dead jobs
 
+To run only selected queues while keeping every queue and worker registered,
+call `only_queue` once for each queue to process:
+
+```rust
+let runtime = storage
+    .runtime(ctx)
+    .register::<Components>()
+    .only_queue::<PriorityQueue>()
+    .only_queue::<EmailQueue>();
+
+runtime.run().await?;
+```
+
+Selecting a dynamic queue processes all of its discovered subqueues. Cron jobs
+for unselected queues are not scheduled. Without any `only_queue` calls, all
+registered queues run as usual.
+
 `Storage` remains the enqueueing and monitoring handle; `RuntimeBuilder<C>` is the worker setup and execution handle for app context type `C`.
 
 Worker errors use their `Debug` representation by default so error types that capture backtraces
