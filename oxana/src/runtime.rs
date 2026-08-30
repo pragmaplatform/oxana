@@ -101,6 +101,23 @@ where
         self
     }
 
+    /// Excludes the specified queue from this runtime.
+    ///
+    /// This method can be called multiple times to exclude multiple queues.
+    /// Excluding a dynamic queue includes all of its discovered subqueues. Cron
+    /// jobs targeting excluded queues are not scheduled.
+    ///
+    /// The excluded queue must also be registered before [`Self::run`] is
+    /// called, either explicitly or through a component registry or cron
+    /// worker.
+    pub fn except_queue<Q>(mut self) -> Self
+    where
+        Q: Queue,
+    {
+        self.settings.queue_denylist.insert(Q::to_config());
+        self
+    }
+
     /// Registers a worker for a job type.
     pub fn worker<W, A>(mut self) -> Self
     where
@@ -332,6 +349,20 @@ where
             )));
         }
 
+        let mut missing_queues: Vec<String> = self
+            .settings
+            .queue_denylist
+            .difference(&self.config.queues)
+            .map(QueueConfig::key_or_prefix)
+            .collect();
+        if !missing_queues.is_empty() {
+            missing_queues.sort();
+            return Err(OxanaError::ConfigError(format!(
+                "Excluded queues are not registered: {}",
+                missing_queues.join(", ")
+            )));
+        }
+
         if self.settings.dead_process_threshold <= self.settings.heartbeat_interval {
             tracing::warn!(
                 dead_process_threshold_ms = self.settings.dead_process_threshold.as_millis(),
@@ -452,6 +483,34 @@ mod tests {
     }
 
     #[test]
+    fn except_queue_builds_a_denylist_without_changing_the_catalog() {
+        let runtime = test_storage()
+            .runtime(())
+            .queue::<QueueOne>()
+            .queue::<QueueTwo>()
+            .queue::<DynamicQueue>()
+            .except_queue::<QueueTwo>()
+            .except_queue::<DynamicQueue>();
+
+        assert!(runtime.settings.runs_queue(&QueueOne::to_config()));
+        assert!(!runtime.settings.runs_queue(&QueueTwo::to_config()));
+        assert!(!runtime.settings.runs_queue(&DynamicQueue::to_config()));
+        assert!(runtime.settings.runs_static_queue("one"));
+        assert!(!runtime.settings.runs_static_queue("two"));
+
+        let catalog = runtime.catalog();
+        assert_eq!(catalog.queues.len(), 3);
+        assert!(catalog.queues.iter().any(|queue| queue.key == "one"));
+        assert!(catalog.queues.iter().any(|queue| queue.key == "two"));
+        assert!(
+            catalog
+                .queues
+                .iter()
+                .any(|queue| queue.key == "dynamic" && queue.dynamic)
+        );
+    }
+
+    #[test]
     fn runtime_runs_all_queues_without_an_allowlist() {
         let runtime = test_storage()
             .runtime(())
@@ -479,6 +538,22 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn run_rejects_an_unregistered_excluded_queue() {
+        let result = test_storage()
+            .runtime(())
+            .except_queue::<QueueTwo>()
+            .run()
+            .await;
+
+        match result {
+            Err(OxanaError::ConfigError(message)) => {
+                assert_eq!(message, "Excluded queues are not registered: two");
+            }
+            _ => panic!("expected an unregistered queue configuration error"),
+        }
+    }
+
     #[test]
     fn dynamic_queue_selection_matches_the_parent_configuration() {
         let runtime = test_storage()
@@ -494,5 +569,22 @@ mod tests {
 
         assert!(matches!(selected.kind, QueueKind::Dynamic { .. }));
         assert!(runtime.settings.runs_queue(&DynamicQueue::to_config()));
+    }
+
+    #[test]
+    fn dynamic_queue_exclusion_matches_the_parent_configuration() {
+        let runtime = test_storage()
+            .runtime(())
+            .queue::<DynamicQueue>()
+            .except_queue::<DynamicQueue>();
+        let excluded = runtime
+            .settings
+            .queue_denylist
+            .iter()
+            .next()
+            .expect("dynamic queue should be excluded");
+
+        assert!(matches!(excluded.kind, QueueKind::Dynamic { .. }));
+        assert!(!runtime.settings.runs_queue(&DynamicQueue::to_config()));
     }
 }
