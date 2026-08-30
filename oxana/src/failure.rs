@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::future::Future;
 use std::sync::Arc;
+#[cfg(feature = "sentry")]
+use std::sync::Mutex;
 
 use serde::Serialize;
 
@@ -47,6 +49,8 @@ pub struct FailedJobMetadata {
     pub max_retries: u32,
     /// Whether this job will be retried after the failure.
     pub will_retry: bool,
+    /// Whether this failure is terminal for this job.
+    pub terminal: bool,
 }
 
 /// Execution metadata attached to a worker failure report.
@@ -65,8 +69,12 @@ pub struct WorkerFailureMetadata {
     pub job_name: String,
     /// The concrete worker type name.
     pub worker_name: String,
+    /// The number of jobs processed by the failed execution.
+    pub batch_size: usize,
     /// Whether at least one affected job will be retried.
     pub will_retry: bool,
+    /// Whether the failure is terminal for every affected job.
+    pub terminal: bool,
 }
 
 /// A worker failure and its execution metadata.
@@ -84,31 +92,64 @@ pub(crate) type FailureReporterFn = dyn for<'a> Fn(WorkerFailureReport<'a>) + Se
 pub(crate) struct ExecutionSentryHub {
     #[cfg(feature = "sentry")]
     hub: Arc<sentry_core::Hub>,
+    #[cfg(feature = "sentry")]
+    panic_event: Arc<Mutex<Option<sentry_core::protocol::Event<'static>>>>,
 }
 
 pub(crate) fn execution_sentry_hub() -> ExecutionSentryHub {
     #[cfg(feature = "sentry")]
     {
         let hub = Arc::new(sentry_core::Hub::new_from_top(sentry_core::Hub::current()));
+        let panic_event = Arc::new(Mutex::new(None));
+        let panic_event_for_processor = Arc::clone(&panic_event);
         hub.configure_scope(|scope| {
             // Sentry's panic hook runs before Oxana's catch_unwind completes.
-            // Suppress events emitted during that unwind so the caught panic
-            // can be reported once, after custom reporter selection and with
-            // failure-only metadata applied.
-            scope.add_event_processor(|event| {
+            // Retain the first event emitted during that unwind. The panic
+            // integration runs before destructors, so this preserves its
+            // stacktrace while still delaying capture until after custom
+            // reporter selection.
+            scope.add_event_processor(move |event| {
                 if std::thread::panicking() {
+                    if is_panic_integration_event(&event) {
+                        let mut panic_event = panic_event_for_processor
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if panic_event.is_none() {
+                            *panic_event = Some(event);
+                        }
+                    }
                     None
                 } else {
                     Some(event)
                 }
             });
         });
-        ExecutionSentryHub { hub }
+        ExecutionSentryHub { hub, panic_event }
     }
 
     #[cfg(not(feature = "sentry"))]
     {
         ExecutionSentryHub {}
+    }
+}
+
+#[cfg(feature = "sentry")]
+fn is_panic_integration_event(event: &sentry_core::protocol::Event<'_>) -> bool {
+    event.exception.iter().any(|exception| {
+        exception
+            .mechanism
+            .as_ref()
+            .is_some_and(|mechanism| mechanism.ty == "panic")
+    })
+}
+
+#[cfg(feature = "sentry")]
+impl ExecutionSentryHub {
+    fn take_panic_event(&self) -> Option<sentry_core::protocol::Event<'static>> {
+        self.panic_event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 }
 
@@ -164,29 +205,71 @@ where
 
 #[cfg(feature = "sentry")]
 fn default_sentry_report(report: WorkerFailureReport<'_>, execution_hub: &ExecutionSentryHub) {
-    with_failure_sentry_scope(report, execution_hub, || match report.failure {
-        WorkerFailure::Error(error) => {
+    match report.failure {
+        WorkerFailure::Error(error) => with_failure_sentry_scope(report, execution_hub, || {
             sentry_core::capture_error(error);
-        }
+        }),
         WorkerFailure::Panic { message } => {
-            use sentry_core::protocol::{Event, Exception, Mechanism};
-
-            sentry_core::capture_event(Event {
-                exception: vec![Exception {
-                    ty: "panic".to_string(),
-                    value: Some(message.to_string()),
-                    mechanism: Some(Mechanism {
-                        ty: "oxana.worker_panic".to_string(),
-                        handled: Some(true),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }]
-                .into(),
-                level: sentry_core::Level::Error,
-                ..Default::default()
-            });
+            let event = execution_hub
+                .take_panic_event()
+                .map_or_else(|| fallback_panic_event(message), mark_panic_event_handled);
+            capture_panic_event(report, execution_hub, event);
         }
+    }
+}
+
+#[cfg(feature = "sentry")]
+fn mark_panic_event_handled(
+    mut event: sentry_core::protocol::Event<'static>,
+) -> sentry_core::protocol::Event<'static> {
+    if let Some(exception) = event.exception.first_mut() {
+        let mechanism = exception
+            .mechanism
+            .get_or_insert_with(sentry_core::protocol::Mechanism::default);
+        mechanism.ty = "oxana.worker_panic".to_string();
+        mechanism.handled = Some(true);
+    }
+    event.level = sentry_core::Level::Error;
+    event
+}
+
+#[cfg(feature = "sentry")]
+fn fallback_panic_event(message: &str) -> sentry_core::protocol::Event<'static> {
+    use sentry_core::protocol::{Event, Exception, Mechanism};
+
+    Event {
+        exception: vec![Exception {
+            ty: "panic".to_string(),
+            value: Some(message.to_string()),
+            mechanism: Some(Mechanism {
+                ty: "oxana.worker_panic".to_string(),
+                handled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]
+        .into(),
+        level: sentry_core::Level::Error,
+        ..Default::default()
+    }
+}
+
+#[cfg(feature = "sentry")]
+fn capture_panic_event(
+    report: WorkerFailureReport<'_>,
+    execution_hub: &ExecutionSentryHub,
+    event: sentry_core::protocol::Event<'static>,
+) {
+    // The retained event already contains the execution scope that Sentry
+    // applied before our processor intercepted it. Capture it through a fresh
+    // scope on the same client to avoid duplicating worker breadcrumbs while
+    // adding failure-only metadata.
+    let reporting_hub = Arc::new(sentry_core::Hub::new(
+        execution_hub.hub.client(),
+        Arc::new(sentry_core::Scope::default()),
+    ));
+    with_failure_sentry_scope_on_hub(report, reporting_hub, || {
+        sentry_core::capture_event(event);
     });
 }
 
@@ -196,7 +279,16 @@ fn with_failure_sentry_scope<R>(
     execution_hub: &ExecutionSentryHub,
     callback: impl FnOnce() -> R,
 ) -> R {
-    sentry_core::Hub::run(Arc::clone(&execution_hub.hub), || {
+    with_failure_sentry_scope_on_hub(report, Arc::clone(&execution_hub.hub), callback)
+}
+
+#[cfg(feature = "sentry")]
+fn with_failure_sentry_scope_on_hub<R>(
+    report: WorkerFailureReport<'_>,
+    hub: Arc<sentry_core::Hub>,
+    callback: impl FnOnce() -> R,
+) -> R {
+    sentry_core::Hub::run(hub, || {
         sentry_core::with_scope(
             |scope| {
                 configure_sentry_scope(scope, report.metadata);
@@ -212,8 +304,9 @@ fn configure_sentry_scope(scope: &mut sentry_core::Scope, metadata: &WorkerFailu
     scope.set_tag("oxana.queue", &metadata.queue);
     scope.set_tag("oxana.job", &metadata.job_name);
     scope.set_tag("oxana.worker", &metadata.worker_name);
-    scope.set_tag("oxana.batch_size", metadata.jobs.len());
+    scope.set_tag("oxana.batch_size", metadata.batch_size);
     scope.set_tag("oxana.will_retry", metadata.will_retry);
+    scope.set_tag("oxana.terminal", metadata.terminal);
 
     if let [job] = metadata.jobs.as_slice() {
         scope.set_tag("oxana.job_id", &job.job_id);
@@ -257,18 +350,29 @@ mod tests {
             retry_count,
             max_retries,
             will_retry,
+            terminal: !will_retry,
         }
     }
 
     fn metadata(queue: &str, jobs: Vec<FailedJobMetadata>) -> WorkerFailureMetadata {
         let will_retry = jobs.iter().any(|job| job.will_retry);
         WorkerFailureMetadata {
+            batch_size: jobs.len(),
             jobs,
             queue: queue.to_string(),
             job_name: "test::EmailJob".to_string(),
             worker_name: "test::EmailWorker".to_string(),
             will_retry,
+            terminal: !will_retry,
         }
+    }
+
+    fn item<T>(items: &[T], index: usize) -> &T {
+        items.get(index).expect("test item")
+    }
+
+    fn json_field<'a>(value: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
+        value.get(key).expect("JSON field")
     }
 
     fn report_failure(reporter: Option<&Arc<FailureReporterFn>>, report: WorkerFailureReport<'_>) {
@@ -286,8 +390,9 @@ mod tests {
         let saw_arguments_for_reporter = Arc::clone(&saw_arguments);
         let reporter: Arc<FailureReporterFn> = Arc::new(move |report| {
             calls_for_reporter.fetch_add(1, Ordering::SeqCst);
+            let reported_job = item(&report.metadata.jobs, 0);
             saw_arguments_for_reporter.store(
-                report.metadata.jobs[0].args == serde_json::json!({ "source": "custom-id" }),
+                reported_job.args == serde_json::json!({ "source": "custom-id" }),
                 Ordering::SeqCst,
             );
             if let WorkerFailure::Error(error) = report.failure {
@@ -328,9 +433,10 @@ mod tests {
         #[cfg(feature = "sentry")]
         {
             assert_eq!(events.len(), 1, "the default capture must be replaced");
-            assert_eq!(events[0].message.as_deref(), Some("custom capture"));
-            assert!(!events[0].tags.contains_key("oxana.job_id"));
-            assert!(!events[0].contexts.contains_key("oxana"));
+            let event = item(&events, 0);
+            assert_eq!(event.message.as_deref(), Some("custom capture"));
+            assert!(!event.tags.contains_key("oxana.job_id"));
+            assert!(!event.contexts.contains_key("oxana"));
         }
     }
 
@@ -342,6 +448,11 @@ mod tests {
             Some(sentry_core::protocol::Context::Other(context)) => context,
             context => panic!("expected Oxana context, got {context:?}"),
         }
+    }
+
+    #[cfg(feature = "sentry")]
+    fn tag<'a>(event: &'a sentry_core::protocol::Event<'_>, key: &str) -> &'a str {
+        event.tags.get(key).map(String::as_str).expect("event tag")
     }
 
     #[cfg(feature = "sentry")]
@@ -360,7 +471,7 @@ mod tests {
         });
 
         assert_eq!(events.len(), 1);
-        let event = &events[0];
+        let event = item(&events, 0);
         assert_eq!(
             event.tags.get("oxana.queue").map(String::as_str),
             Some("mailers")
@@ -408,6 +519,7 @@ mod tests {
                 "retry_count": 1,
                 "max_retries": 3,
                 "will_retry": true,
+                "terminal": false,
             })])
         );
     }
@@ -456,8 +568,8 @@ mod tests {
             .iter()
             .find(|event| !event.exception.is_empty())
             .expect("worker failure event");
-        assert_eq!(failure.tags["worker.context"], "preserved");
-        assert_eq!(failure.tags["oxana.job_id"], "job-123");
+        assert_eq!(tag(failure, "worker.context"), "preserved");
+        assert_eq!(tag(failure, "oxana.job_id"), "job-123");
         assert_eq!(
             failure.user.as_ref().and_then(|user| user.id.as_deref()),
             Some("worker-user")
@@ -468,10 +580,12 @@ mod tests {
                 .iter()
                 .any(|breadcrumb| { breadcrumb.message.as_deref() == Some("worker breadcrumb") })
         );
-        assert_eq!(
-            oxana_context(failure)["jobs"][0]["args"]["source"],
-            "job-123"
-        );
+        let jobs = oxana_context(failure)
+            .get("jobs")
+            .and_then(serde_json::Value::as_array)
+            .expect("failure jobs");
+        let args = json_field(item(jobs, 0), "args");
+        assert_eq!(json_field(args, "source"), "job-123");
     }
 
     #[cfg(feature = "sentry")]
@@ -490,7 +604,7 @@ mod tests {
         });
 
         assert_eq!(events.len(), 1);
-        let event = &events[0];
+        let event = item(&events, 0);
         assert_eq!(
             event.tags.get("oxana.batch_size").map(String::as_str),
             Some("2")
@@ -508,12 +622,22 @@ mod tests {
             .and_then(serde_json::Value::as_array)
             .expect("batch jobs metadata");
         assert_eq!(jobs.len(), 2);
-        assert_eq!(jobs[0]["job_id"], "retrying");
-        assert_eq!(jobs[0]["args"], serde_json::json!({ "source": "retrying" }));
-        assert_eq!(jobs[0]["will_retry"], true);
-        assert_eq!(jobs[1]["job_id"], "terminal");
-        assert_eq!(jobs[1]["args"], serde_json::json!({ "source": "terminal" }));
-        assert_eq!(jobs[1]["will_retry"], false);
+        let retrying_job = item(jobs, 0);
+        assert_eq!(json_field(retrying_job, "job_id"), "retrying");
+        assert_eq!(
+            json_field(retrying_job, "args"),
+            &serde_json::json!({ "source": "retrying" })
+        );
+        assert_eq!(json_field(retrying_job, "will_retry"), true);
+        assert_eq!(json_field(retrying_job, "terminal"), false);
+        let terminal_job = item(jobs, 1);
+        assert_eq!(json_field(terminal_job, "job_id"), "terminal");
+        assert_eq!(
+            json_field(terminal_job, "args"),
+            &serde_json::json!({ "source": "terminal" })
+        );
+        assert_eq!(json_field(terminal_job, "will_retry"), false);
+        assert_eq!(json_field(terminal_job, "terminal"), true);
     }
 
     #[cfg(feature = "sentry")]
@@ -533,13 +657,17 @@ mod tests {
                 );
             }
         });
-        events.sort_by(|left, right| left.tags["oxana.queue"].cmp(&right.tags["oxana.queue"]));
+        events.sort_by(|left, right| tag(left, "oxana.queue").cmp(tag(right, "oxana.queue")));
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].tags["oxana.queue"], "retrying");
-        assert_eq!(events[0].tags["oxana.will_retry"], "true");
-        assert_eq!(events[1].tags["oxana.queue"], "terminal");
-        assert_eq!(events[1].tags["oxana.will_retry"], "false");
+        let retrying_event = item(&events, 0);
+        assert_eq!(tag(retrying_event, "oxana.queue"), "retrying");
+        assert_eq!(tag(retrying_event, "oxana.will_retry"), "true");
+        assert_eq!(tag(retrying_event, "oxana.terminal"), "false");
+        let terminal_event = item(&events, 1);
+        assert_eq!(tag(terminal_event, "oxana.queue"), "terminal");
+        assert_eq!(tag(terminal_event, "oxana.will_retry"), "false");
+        assert_eq!(tag(terminal_event, "oxana.terminal"), "true");
     }
 
     #[cfg(feature = "sentry")]
@@ -583,14 +711,98 @@ mod tests {
         second.await.expect("second report task");
 
         let mut events = transport.fetch_and_clear_events();
-        events.sort_by(|left, right| left.tags["oxana.queue"].cmp(&right.tags["oxana.queue"]));
+        events.sort_by(|left, right| tag(left, "oxana.queue").cmp(tag(right, "oxana.queue")));
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].tags["oxana.queue"], "queue-a");
-        assert_eq!(events[0].tags["oxana.job_id"], "job-a");
-        assert_eq!(oxana_context(&events[0])["queue"], "queue-a");
-        assert_eq!(events[1].tags["oxana.queue"], "queue-b");
-        assert_eq!(events[1].tags["oxana.job_id"], "job-b");
-        assert_eq!(oxana_context(&events[1])["queue"], "queue-b");
+        let first_event = item(&events, 0);
+        assert_eq!(tag(first_event, "oxana.queue"), "queue-a");
+        assert_eq!(tag(first_event, "oxana.job_id"), "job-a");
+        assert_eq!(
+            oxana_context(first_event).get("queue"),
+            Some(&serde_json::json!("queue-a"))
+        );
+        let second_event = item(&events, 1);
+        assert_eq!(tag(second_event, "oxana.queue"), "queue-b");
+        assert_eq!(tag(second_event, "oxana.job_id"), "job-b");
+        assert_eq!(
+            oxana_context(second_event).get("queue"),
+            Some(&serde_json::json!("queue-b"))
+        );
+    }
+
+    #[cfg(feature = "sentry")]
+    #[test]
+    fn default_report_preserves_panic_integration_stacktrace() {
+        use futures::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
+        let metadata = metadata("panics", vec![job("panic-id", 0, 0)]);
+        let options = sentry_core::ClientOptions::new()
+            .add_integration(sentry_panic::PanicIntegration::default());
+        let events = sentry_core::test::with_captured_events_options(
+            || {
+                let (result, execution_hub) =
+                    futures::executor::block_on(with_execution_sentry_hub(
+                        AssertUnwindSafe(async {
+                            sentry_core::configure_scope(|scope| {
+                                scope.set_tag("worker.context", "preserved");
+                            });
+                            sentry_core::add_breadcrumb(sentry_core::Breadcrumb {
+                                message: Some("before panic".to_string()),
+                                ..Default::default()
+                            });
+                            panic!("worker panicked");
+                        })
+                        .catch_unwind(),
+                    ));
+                assert!(result.is_err());
+                super::report_failure(
+                    None,
+                    WorkerFailureReport {
+                        failure: WorkerFailure::Panic {
+                            message: "worker panicked",
+                        },
+                        metadata: &metadata,
+                    },
+                    &execution_hub,
+                );
+            },
+            options,
+        );
+
+        assert_eq!(events.len(), 1);
+        let event = item(&events, 0);
+        let exception = item(event.exception.as_ref(), 0);
+        let stacktrace = exception
+            .stacktrace
+            .as_ref()
+            .expect("panic integration stacktrace");
+        assert!(!stacktrace.frames.is_empty());
+        assert_eq!(
+            exception
+                .mechanism
+                .as_ref()
+                .and_then(|mechanism| mechanism.handled),
+            Some(true)
+        );
+        assert_eq!(
+            exception
+                .mechanism
+                .as_ref()
+                .map(|mechanism| mechanism.ty.as_str()),
+            Some("oxana.worker_panic")
+        );
+        assert_eq!(tag(event, "worker.context"), "preserved");
+        assert_eq!(tag(event, "oxana.job_id"), "panic-id");
+        assert_eq!(tag(event, "oxana.terminal"), "true");
+        assert_eq!(
+            event
+                .breadcrumbs
+                .iter()
+                .filter(|breadcrumb| breadcrumb.message.as_deref() == Some("before panic"))
+                .count(),
+            1,
+            "worker breadcrumbs must not be duplicated when the event is recaptured"
+        );
     }
 
     #[cfg(feature = "sentry")]
@@ -602,7 +814,8 @@ mod tests {
         let metadata = metadata("panics", vec![job("panic-id", 0, 0)]);
         let reporter: Arc<FailureReporterFn> = Arc::new(|report| {
             assert!(matches!(report.failure, WorkerFailure::Panic { .. }));
-            assert_eq!(report.metadata.jobs[0].args["source"], "panic-id");
+            let reported_job = item(&report.metadata.jobs, 0);
+            assert_eq!(json_field(&reported_job.args, "source"), "panic-id");
             sentry_core::capture_message("redacted panic", sentry_core::Level::Error);
         });
         let options = sentry_core::ClientOptions::new()
@@ -629,9 +842,10 @@ mod tests {
         );
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].message.as_deref(), Some("redacted panic"));
-        assert!(events[0].exception.is_empty());
-        assert!(!events[0].contexts.contains_key("oxana"));
+        let event = item(&events, 0);
+        assert_eq!(event.message.as_deref(), Some("redacted panic"));
+        assert!(event.exception.is_empty());
+        assert!(!event.contexts.contains_key("oxana"));
     }
 
     #[cfg(feature = "sentry")]
@@ -651,19 +865,18 @@ mod tests {
         });
 
         assert_eq!(events.len(), 1);
-        assert!(events[0].message.is_none());
-        assert_eq!(events[0].exception[0].ty, "panic");
+        let event = item(&events, 0);
+        let exception = item(event.exception.as_ref(), 0);
+        assert!(event.message.is_none());
+        assert_eq!(exception.ty, "panic");
+        assert_eq!(exception.value.as_deref(), Some("worker panicked"));
         assert_eq!(
-            events[0].exception[0].value.as_deref(),
-            Some("worker panicked")
-        );
-        assert_eq!(
-            events[0].exception[0]
+            exception
                 .mechanism
                 .as_ref()
                 .and_then(|mechanism| mechanism.handled),
             Some(true)
         );
-        assert_eq!(events[0].tags["oxana.failure_kind"], "panic");
+        assert_eq!(tag(event, "oxana.failure_kind"), "panic");
     }
 }
