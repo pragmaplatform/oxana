@@ -39,6 +39,9 @@ where
     joinset.spawn(cleanup_loop(Arc::clone(&runtime)));
 
     for queue_config in &runtime.queues {
+        if !runtime.settings.runs_queue(queue_config) {
+            continue;
+        }
         coordinator_joinset.spawn(coordinator::run(
             Arc::clone(&runtime),
             Arc::clone(&stats),
@@ -218,6 +221,9 @@ where
     let mut set = JoinSet::new();
 
     for (name, cron_job) in &runtime.registry.schedules {
+        if !runtime.settings.runs_static_queue(&cron_job.queue_key) {
+            continue;
+        }
         set.spawn(cron_job_loop(
             Arc::clone(&runtime),
             name.clone(),
