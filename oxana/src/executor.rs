@@ -306,12 +306,14 @@ fn failure_metadata(
                 retry_count: envelope.meta.retries,
                 max_retries: policy.max_retries,
                 will_retry,
+                terminal: !will_retry,
             }
         })
         .collect::<Vec<_>>();
     let will_retry = jobs.iter().any(|job| job.will_retry);
 
     WorkerFailureMetadata {
+        batch_size: jobs.len(),
         jobs,
         queue: envelopes
             .first()
@@ -319,6 +321,7 @@ fn failure_metadata(
         job_name: names.job.to_string(),
         worker_name: names.worker.to_string(),
         will_retry,
+        terminal: !will_retry,
     }
 }
 

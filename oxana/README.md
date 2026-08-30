@@ -271,9 +271,10 @@ let runtime = storage.runtime(ctx).failure_reporter(|report| {
 ```
 
 The callback is also available without the `sentry` feature. Sentry's panic integration runs before
-Oxana catches a worker panic, so Oxana suppresses that pre-catch event on the isolated worker hub and
-reports the caught panic once after selecting the default or custom reporter. This prevents both a
-duplicate event and argument capture before custom redaction can run.
+Oxana catches a worker panic, so Oxana intercepts its event on the isolated worker hub. The built-in
+reporter enriches and submits that event after the catch, preserving its stacktrace. A custom
+reporter replaces and discards the intercepted event. This prevents both a duplicate event and
+argument capture before custom redaction can run.
 
 Serialized job arguments are included in failure metadata and default Sentry events. Arguments can
 contain sensitive application data; custom reporters receive the metadata without Oxana attaching

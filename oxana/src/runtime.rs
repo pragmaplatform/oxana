@@ -199,10 +199,11 @@ where
     /// available and runs without any Sentry dependency.
     ///
     /// Sentry's panic integration observes a panic before Oxana catches it.
-    /// Oxana suppresses that pre-catch event on the isolated worker hub, then
-    /// reports the caught panic once after selecting the default or custom
-    /// reporter. This prevents both duplicate events and argument capture
-    /// before a custom reporter can redact the metadata.
+    /// Oxana intercepts that event on the isolated worker hub. The built-in
+    /// reporter enriches and submits it after the panic is caught, preserving
+    /// its stacktrace. A custom reporter replaces and discards the intercepted
+    /// event. This prevents both duplicate events and argument capture before
+    /// a custom reporter can redact the metadata.
     pub fn failure_reporter(
         mut self,
         reporter: impl for<'a> Fn(WorkerFailureReport<'a>) + Send + Sync + 'static,
