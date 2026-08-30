@@ -238,6 +238,22 @@ Selecting a dynamic queue processes all of its discovered subqueues. Cron jobs
 for unselected queues are not scheduled. Without any `only_queue` calls, all
 registered queues run as usual.
 
+To run every registered queue except specific ones, call `except_queue` once
+for each queue to exclude:
+
+```rust
+let runtime = storage
+    .runtime(ctx)
+    .register::<Components>()
+    .except_queue::<LowPriorityQueue>()
+    .except_queue::<MaintenanceQueue>();
+
+runtime.run().await?;
+```
+
+Excluding a dynamic queue excludes all of its discovered subqueues. Cron jobs
+for excluded queues are not scheduled.
+
 `Storage` remains the enqueueing and monitoring handle; `RuntimeBuilder<C>` is the worker setup and execution handle for app context type `C`.
 
 Worker errors use their `Debug` representation by default so error types that capture backtraces
