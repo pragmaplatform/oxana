@@ -200,6 +200,57 @@ pub async fn test_runtime_only_processes_selected_queues() -> TestResult {
 }
 
 #[tokio::test]
+pub async fn test_runtime_does_not_process_excluded_queues() -> TestResult {
+    let redis_pool = setup();
+    let mut redis_conn = redis_pool.get().await?;
+    let ctx = WorkerState {
+        redis: redis_pool.clone(),
+    };
+    let storage = oxana::Storage::builder()
+        .namespace(random_string())
+        .build_from_pool(redis_pool.clone())?;
+    let runtime = storage
+        .runtime(ctx)
+        .queue::<QueueOne>()
+        .queue::<QueueTwo>()
+        .worker::<WorkerRedisSet, WorkerRedisSetJob>()
+        .except_queue::<QueueTwo>()
+        .exit_when_processed(1);
+    let included_key = random_string();
+    let excluded_key = random_string();
+
+    storage
+        .enqueue(
+            QueueOne,
+            WorkerRedisSetJob {
+                key: included_key.clone(),
+                value: "included".to_string(),
+            },
+        )
+        .await?;
+    storage
+        .enqueue(
+            QueueTwo,
+            WorkerRedisSetJob {
+                key: excluded_key.clone(),
+                value: "excluded".to_string(),
+            },
+        )
+        .await?;
+
+    runtime.run().await?;
+
+    let included: Option<String> = redis_conn.get(included_key).await?;
+    let excluded: Option<String> = redis_conn.get(excluded_key).await?;
+    assert_eq!(included.as_deref(), Some("included"));
+    assert_eq!(excluded, None);
+    assert_eq!(storage.enqueued_count(QueueOne).await?, 0);
+    assert_eq!(storage.enqueued_count(QueueTwo).await?, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 pub async fn test_enqueue_list() -> TestResult {
     let redis_pool = setup();
     let mut redis_conn = redis_pool.get().await?;
