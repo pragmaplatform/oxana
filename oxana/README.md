@@ -265,6 +265,37 @@ let runtime = storage
     .error_formatter(|error| error.to_string());
 ```
 
+With the `sentry` feature enabled, failed executions are reported once by default with isolated
+`oxana.*` tags and an `oxana` context containing job IDs, queue/job/worker names, batch size, and
+per-job arguments and retry state. Applications that need an error-specific integration can replace
+the capture while retaining the original concrete worker error:
+
+```rust
+let runtime = storage.runtime(ctx).failure_reporter(|report| {
+    match report.failure {
+        oxana::WorkerFailure::Error(error) => {
+            // Downcast to your application's worker error and call a richer
+            // integration, such as sentry_anyhow::capture_anyhow(...).
+            report_application_error(error, report.metadata);
+        }
+        oxana::WorkerFailure::Panic { message } => {
+            report_application_panic(message, report.metadata);
+        }
+        _ => {}
+    }
+});
+```
+
+The callback is also available without the `sentry` feature. Sentry's panic integration runs before
+Oxana catches a worker panic, so Oxana intercepts its event on the isolated worker hub. The built-in
+reporter enriches and submits that event after the catch, preserving its stacktrace. A custom
+reporter replaces and discards the intercepted event. This prevents both a duplicate event and
+argument capture before custom redaction can run.
+
+Serialized job arguments are included in failure metadata and default Sentry events. Arguments can
+contain sensitive application data; custom reporters receive the metadata without Oxana attaching
+it automatically, allowing them to redact or omit arguments before capture.
+
 Backtraces must be enabled before the process starts (for example with `RUST_BACKTRACE=1`) and
 captured by the application's error type. Diagnostic output may contain sensitive details, so only
 enable backtraces where access to stored job errors is appropriately restricted.

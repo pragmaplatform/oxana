@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - Store worker errors using `Debug` formatting by default so captured backtraces appear on retry, dead, and drained jobs, and add `RuntimeBuilder::error_formatter` for applications that need a custom representation.
+- Add `RuntimeBuilder::failure_reporter` with typed worker errors and execution metadata including serialized job arguments, enrich isolated default Sentry events, and defer panic-integration events until reporter selection while preserving their stacktraces.
 
 ## [2.1.2] - 2026-08-11
 

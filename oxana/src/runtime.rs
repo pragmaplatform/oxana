@@ -8,6 +8,7 @@ use crate::config::{Config, ErrorFormatterFn, RetryDelayOverrideFn, RuntimeSetti
 use crate::context::ContextValue;
 use crate::drainer::{self, DrainStats};
 use crate::error::OxanaError;
+use crate::failure::{FailureReporterFn, WorkerFailureReport};
 use crate::queue::{Queue, QueueConcurrency, QueueConfig, require_non_zero_duration};
 use crate::result_collector::Stats as RunStats;
 use crate::storage::Storage;
@@ -191,6 +192,40 @@ where
         f: impl Fn(&(dyn std::error::Error + Send + Sync + 'static)) -> String + Send + Sync + 'static,
     ) -> Self {
         self.settings.error_formatter = Some(Arc::new(f) as Arc<ErrorFormatterFn>);
+        self
+    }
+
+    /// Replaces Oxana's built-in worker failure reporting.
+    ///
+    /// The callback runs once per failed execution, including once for an
+    /// entire failed batch. Returned errors preserve their concrete type, so
+    /// callers can downcast them and use integrations such as `sentry-anyhow`
+    /// without Oxana depending on that error library. Panic failures are
+    /// represented by [`crate::WorkerFailure::Panic`].
+    ///
+    /// The supplied metadata includes each job's serialized arguments and
+    /// per-job retry state because jobs in one batch can have different retry
+    /// limits or attempt counts. Arguments can contain sensitive application
+    /// data; use the custom reporter to filter or omit them when necessary.
+    ///
+    /// When the `sentry` feature is enabled, the callback runs on the worker's
+    /// isolated execution hub, retaining breadcrumbs and scope changes made by
+    /// the worker. The metadata is passed explicitly instead of being attached
+    /// automatically, so the callback controls whether arguments are captured,
+    /// redacted, or omitted. Without the feature, the callback remains
+    /// available and runs without any Sentry dependency.
+    ///
+    /// Sentry's panic integration observes a panic before Oxana catches it.
+    /// Oxana intercepts that event on the isolated worker hub. The built-in
+    /// reporter enriches and submits it after the panic is caught, preserving
+    /// its stacktrace. A custom reporter replaces and discards the intercepted
+    /// event. This prevents both duplicate events and argument capture before
+    /// a custom reporter can redact the metadata.
+    pub fn failure_reporter(
+        mut self,
+        reporter: impl for<'a> Fn(WorkerFailureReport<'a>) + Send + Sync + 'static,
+    ) -> Self {
+        self.settings.failure_reporter = Some(Arc::new(reporter) as Arc<FailureReporterFn>);
         self
     }
 
