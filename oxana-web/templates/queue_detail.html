@@ -144,8 +144,8 @@
                     {% match item.job_envelope.meta.state %}
                     {% when Some with (state) %}
                     {% if state|has_args %}
-                    {% if state|show_job_progress %}
                     {% let progress_started_at = item.job_envelope.meta.started_at %}
+                    {% if let Some(progress) = state|job_progress(progress_started_at) %}
                     {% include "_job_progress.html" %}
                     {% else %}
                     <details class="mt-3">
@@ -171,34 +171,34 @@
             <div>
                 <h2 class="text-lg font-semibold">Enqueued</h2>
                 <div class="mt-1 text-sm text-gray-400">
-                {% if total > 0 %}
-                {{ self.range_start() }}&ndash;{{ self.range_end() }} of {{ total }} jobs
+                {% if page.total > 0 %}
+                {{ page.range_start() }}&ndash;{{ page.range_end() }} of {{ page.total }} jobs
                 {% else %}
                 0 jobs
                 {% endif %}
                 </div>
             </div>
             <div class="flex items-center gap-2 text-sm">
-                {% if page > 1 %}
-                <a href="?page={{ page - 1 }}" class="px-3 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-gray-300">&larr; Prev</a>
+                {% if page.number > 1 %}
+                <a href="?page={{ page.number - 1 }}" class="px-3 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-gray-300">&larr; Prev</a>
                 {% else %}
                 <span class="px-3 py-1 rounded bg-gray-900 border border-gray-800 text-gray-600 cursor-not-allowed">&larr; Prev</span>
                 {% endif %}
-                {% if has_next %}
-                <a href="?page={{ page + 1 }}" class="px-3 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-gray-300">Next &rarr;</a>
+                {% if page.has_next %}
+                <a href="?page={{ page.number + 1 }}" class="px-3 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-gray-300">Next &rarr;</a>
                 {% else %}
                 <span class="px-3 py-1 rounded bg-gray-900 border border-gray-800 text-gray-600 cursor-not-allowed">Next &rarr;</span>
                 {% endif %}
             </div>
         </div>
 
-        {% if jobs.is_empty() %}
+        {% if page.jobs.is_empty() %}
         <div class="bg-gray-900 border border-gray-800 rounded-lg p-6 text-center text-gray-500">
             No jobs in this queue
         </div>
         {% else %}
         <div class="space-y-3">
-            {% for job in &jobs %}
+            {% for job in &page.jobs %}
             <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
                 <div class="flex items-start justify-between mb-2">
                     <span class="font-semibold text-sm">{{ job.job.name }}</span>
@@ -229,8 +229,8 @@
                 {% match job.meta.state %}
                 {% when Some with (state) %}
                 {% if state|has_args %}
-                {% if state|show_job_progress %}
                 {% let progress_started_at = job.meta.started_at %}
+                {% if let Some(progress) = state|job_progress(progress_started_at) %}
                 {% include "_job_progress.html" %}
                 {% else %}
                 <details class="mt-3">
@@ -251,13 +251,13 @@
         </div>
 
         <div class="flex items-center justify-between mt-6 text-sm">
-            <span class="text-gray-500">{{ self.range_start() }}&ndash;{{ self.range_end() }} of {{ total }}</span>
+            <span class="text-gray-500">{{ page.range_start() }}&ndash;{{ page.range_end() }} of {{ page.total }}</span>
             <div class="flex items-center gap-2">
-                {% if page > 1 %}
-                <a href="?page={{ page - 1 }}" class="px-3 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-gray-300">&larr; Prev</a>
+                {% if page.number > 1 %}
+                <a href="?page={{ page.number - 1 }}" class="px-3 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-gray-300">&larr; Prev</a>
                 {% endif %}
-                {% if has_next %}
-                <a href="?page={{ page + 1 }}" class="px-3 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-gray-300">Next &rarr;</a>
+                {% if page.has_next %}
+                <a href="?page={{ page.number + 1 }}" class="px-3 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-gray-300">Next &rarr;</a>
                 {% endif %}
             </div>
         </div>

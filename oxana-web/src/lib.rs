@@ -1,6 +1,7 @@
 mod error;
 mod filters;
 mod handlers;
+mod pagination;
 mod templates;
 
 use axum::{

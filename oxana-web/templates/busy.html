@@ -153,8 +153,8 @@
                     {% match item.job_envelope.meta.state %}
                     {% when Some with (state) %}
                     {% if state|has_args %}
-                    {% if state|show_job_progress %}
                     {% let progress_started_at = item.job_envelope.meta.started_at %}
+                    {% if let Some(progress) = state|job_progress(progress_started_at) %}
                     {% include "_job_progress.html" %}
                     {% else %}
                     <div class="mt-3">

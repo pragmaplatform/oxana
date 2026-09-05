@@ -80,8 +80,8 @@
 
             {% match job.meta.state %}
             {% when Some with (state) %}
-            {% if state|show_job_progress %}
             {% let progress_started_at = job.meta.started_at %}
+            {% if let Some(progress) = state|job_progress(progress_started_at) %}
             {% include "_job_progress.html" %}
             {% else %}
             <details class="mt-3" open>

@@ -2,8 +2,8 @@ use askama::Template;
 use askama_web::WebTemplate;
 use std::collections::HashMap;
 
-use crate::JOBS_PER_PAGE;
 use crate::filters;
+use crate::pagination::JobPage;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum QueueConcurrencyStatus {
@@ -912,10 +912,7 @@ pub(crate) struct QueueDetailTemplate {
     pub queue_config: QueueRuntimeConfigView,
     pub active_jobs: Vec<oxana::StatsProcessing>,
     pub busy: usize,
-    pub jobs: Vec<oxana::JobEnvelope>,
-    pub page: usize,
-    pub total: usize,
-    pub has_next: bool,
+    pub page: JobPage,
 }
 
 impl QueueDetailTemplate {
@@ -953,14 +950,6 @@ impl QueueDetailTemplate {
     pub fn queue_action_path(&self, action: &str) -> String {
         queue_action_path(&self.base_path, &self.queue_key, action)
     }
-
-    pub fn range_start(&self) -> usize {
-        (self.page - 1) * JOBS_PER_PAGE + 1
-    }
-
-    pub fn range_end(&self) -> usize {
-        ((self.page - 1) * JOBS_PER_PAGE + self.jobs.len()).min(self.total)
-    }
 }
 
 pub(crate) enum JobListKind {
@@ -970,6 +959,14 @@ pub(crate) enum JobListKind {
 }
 
 impl JobListKind {
+    pub fn path(&self) -> &'static str {
+        match self {
+            Self::Dead => "/dead",
+            Self::Retries => "/retries",
+            Self::Scheduled => "/scheduled",
+        }
+    }
+
     pub fn title(&self) -> &'static str {
         match self {
             Self::Dead => "Dead Jobs",
@@ -1025,20 +1022,7 @@ pub(crate) struct GlobalJobsTemplate {
     pub base_path: String,
     pub active_tab: &'static str,
     pub kind: JobListKind,
-    pub jobs: Vec<oxana::JobEnvelope>,
-    pub page: usize,
-    pub total: usize,
-    pub has_next: bool,
-}
-
-impl GlobalJobsTemplate {
-    pub fn range_start(&self) -> usize {
-        (self.page - 1) * JOBS_PER_PAGE + 1
-    }
-
-    pub fn range_end(&self) -> usize {
-        ((self.page - 1) * JOBS_PER_PAGE + self.jobs.len()).min(self.total)
-    }
+    pub page: JobPage,
 }
 
 #[derive(Template, WebTemplate)]
@@ -1054,6 +1038,7 @@ pub(crate) struct JobDetailTemplate {
 #[cfg(test)]
 mod job_card_tests {
     use super::{GlobalJobsTemplate, JobListKind};
+    use crate::pagination::JobPage;
     use askama::Template;
     use serde_json::json;
 
@@ -1086,18 +1071,86 @@ mod job_card_tests {
     }
 
     #[test]
+    fn global_job_pagination_uses_lookahead_and_preserves_links() {
+        for kind in [
+            JobListKind::Scheduled,
+            JobListKind::Dead,
+            JobListKind::Retries,
+        ] {
+            let jobs = (1..=51)
+                .map(|id| job_envelope_with_id(&format!("job-{id}"), json!({})))
+                .collect();
+            let path = kind.path();
+            let template = GlobalJobsTemplate {
+                base_path: "/admin".to_string(),
+                active_tab: path,
+                kind,
+                page: JobPage::new(2, 101, jobs),
+            };
+            let rendered = template.render().unwrap();
+
+            assert!(rendered.contains("href=\"/admin/jobs/job-50\""));
+            assert!(!rendered.contains("href=\"/admin/jobs/job-51\""));
+            assert!(rendered.contains("href=\"?page=1\""));
+            assert!(rendered.contains("href=\"?page=3\""));
+            assert!(rendered.contains("51&ndash;100 of 101"));
+        }
+    }
+
+    #[test]
+    fn pagination_normalizes_zero_and_does_not_infer_next_page_from_total() {
+        let opts = JobPage::list_opts(0);
+        assert_eq!((opts.offset, opts.count), (0, 51));
+        assert_eq!(JobPage::list_opts(2).offset, 50);
+
+        let page = JobPage::new(0, 100, vec![job_envelope(json!({}))]);
+        assert_eq!(page.number, 1);
+        assert_eq!((page.range_start(), page.range_end()), (1, 1));
+        assert!(!page.has_next);
+
+        let page = JobPage::new(2, 50, vec![job_envelope(json!({}))]);
+        assert_eq!(page.range_end(), 50);
+    }
+
+    #[test]
+    fn global_job_cards_escape_progress_notes_and_keep_other_state_visible() {
+        for (state, expected) in [
+            (json!([1, 4, "<b>Importing</b>"]), "1 / 4 (25%)"),
+            (json!({"checkpoint": "resume-here"}), "resume-here"),
+        ] {
+            let mut job = job_envelope(json!({}));
+            job.meta.state = Some(state);
+            let template = GlobalJobsTemplate {
+                base_path: "/admin".to_string(),
+                active_tab: "/scheduled",
+                kind: JobListKind::Scheduled,
+                page: JobPage::new(1, 1, vec![job]),
+            };
+            let rendered = template.render().unwrap();
+            assert!(rendered.contains(expected));
+            assert!(!rendered.contains("<b>Importing</b>"));
+            if expected == "1 / 4 (25%)" {
+                assert!(rendered.contains("&#60;b&#62;Importing&#60;/b&#62;"));
+                assert!(rendered.contains("style=\"width: 25%\""));
+                assert!(rendered.contains("ETA —"));
+            }
+        }
+    }
+
+    #[test]
     fn global_job_cards_render_simple_arg_pills() {
         let template = GlobalJobsTemplate {
             base_path: "/admin".to_string(),
             active_tab: "/scheduled",
             kind: JobListKind::Scheduled,
-            jobs: vec![job_envelope(json!({
-                "game_id": 12345,
-                "dry_run": false,
-            }))],
-            page: 1,
-            total: 1,
-            has_next: false,
+            page: JobPage::new(
+                1,
+                1,
+                vec![job_envelope(json!({
+                    "game_id": 12345,
+                    "dry_run": false,
+                }))],
+            ),
         };
 
         let rendered = template.render().unwrap();
@@ -1117,13 +1170,14 @@ mod job_card_tests {
             base_path: "/admin".to_string(),
             active_tab: "/scheduled",
             kind: JobListKind::Scheduled,
-            jobs: vec![job_envelope(json!({
-                "game_id": 12345,
-                "metadata": { "season": 2026 },
-            }))],
-            page: 1,
-            total: 1,
-            has_next: false,
+            page: JobPage::new(
+                1,
+                1,
+                vec![job_envelope(json!({
+                    "game_id": 12345,
+                    "metadata": { "season": 2026 },
+                }))],
+            ),
         };
 
         let rendered = template.render().unwrap();
@@ -1143,10 +1197,11 @@ mod job_card_tests {
             base_path: "/admin".to_string(),
             active_tab: "/scheduled",
             kind: JobListKind::Scheduled,
-            jobs: vec![job_envelope_with_id("crate::Worker/type-123", json!({}))],
-            page: 1,
-            total: 1,
-            has_next: false,
+            page: JobPage::new(
+                1,
+                1,
+                vec![job_envelope_with_id("crate::Worker/type-123", json!({}))],
+            ),
         };
 
         let rendered = template.render().unwrap();
@@ -1160,10 +1215,7 @@ mod job_card_tests {
             base_path: "/admin".to_string(),
             active_tab: "/dead",
             kind: JobListKind::Dead,
-            jobs: vec![job_envelope(json!({}))],
-            page: 1,
-            total: 1,
-            has_next: false,
+            page: JobPage::new(1, 1, vec![job_envelope(json!({}))]),
         };
 
         let rendered = template.render().unwrap();
@@ -1179,10 +1231,7 @@ mod job_card_tests {
             base_path: "/admin".to_string(),
             active_tab: "/retries",
             kind: JobListKind::Retries,
-            jobs: vec![job_envelope(json!({}))],
-            page: 1,
-            total: 1,
-            has_next: false,
+            page: JobPage::new(1, 1, vec![job_envelope(json!({}))]),
         };
 
         let rendered = template.render().unwrap();
