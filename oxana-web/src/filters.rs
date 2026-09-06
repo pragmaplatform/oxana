@@ -235,16 +235,49 @@ fn progress_parts(val: &serde_json::Value) -> Option<oxana::JobProgress> {
     serde_json::from_value(val.clone()).ok()
 }
 
-fn should_show_progress(val: &serde_json::Value) -> bool {
-    progress_parts(val).is_some_and(|progress| progress.total > 0)
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ProgressView {
+    pub summary: String,
+    pub percent: String,
+    pub note: String,
+    pub eta: String,
+}
+
+impl ProgressView {
+    fn from_state(
+        state: &serde_json::Value,
+        started_at_micros: Option<i64>,
+        now_micros: i64,
+    ) -> Option<Self> {
+        let progress = progress_parts(state)?;
+        if progress.total <= 0 {
+            return None;
+        }
+
+        let percent =
+            ((progress.cursor.max(0) as f64 / progress.total as f64) * 100.0).clamp(0.0, 100.0);
+        let eta = progress_eta_s(&progress, started_at_micros, now_micros)
+            .map(format_duration_from_secs)
+            .unwrap_or_else(|| "—".to_string());
+
+        Some(Self {
+            summary: format!(
+                "{} / {} ({percent:.0}%)",
+                format_with_commas(progress.cursor.max(0) as u64),
+                format_with_commas(progress.total as u64),
+            ),
+            percent: format!("{percent:.0}"),
+            note: progress.note.unwrap_or_default(),
+            eta,
+        })
+    }
 }
 
 fn progress_eta_s(
-    val: &serde_json::Value,
+    progress: &oxana::JobProgress,
     started_at_micros: Option<i64>,
     now_micros: i64,
 ) -> Option<f64> {
-    let progress = progress_parts(val)?;
     let started_at_micros = started_at_micros?;
     if progress.total <= 0 || progress.cursor <= 0 || started_at_micros <= 0 {
         return None;
@@ -265,89 +298,66 @@ fn progress_eta_s(
 }
 
 #[askama::filter_fn]
-pub fn show_job_progress(
-    val: &serde_json::Value,
-    _env: &dyn askama::Values,
-) -> askama::Result<bool> {
-    Ok(should_show_progress(val))
-}
-
-#[askama::filter_fn]
-pub fn job_progress_percent(
-    val: &serde_json::Value,
-    _env: &dyn askama::Values,
-) -> askama::Result<String> {
-    let Some(progress) = progress_parts(val) else {
-        return Ok("0".to_string());
-    };
-    let cursor = progress.cursor;
-    let total = progress.total;
-    if total <= 0 {
-        return Ok("0".to_string());
-    }
-
-    let percent = ((cursor.max(0) as f64 / total as f64) * 100.0).clamp(0.0, 100.0);
-    Ok(format!("{percent:.0}"))
-}
-
-#[askama::filter_fn]
-pub fn job_progress_summary(
-    val: &serde_json::Value,
-    _env: &dyn askama::Values,
-) -> askama::Result<String> {
-    let Some(progress) = progress_parts(val) else {
-        return Ok("0 / 0".to_string());
-    };
-    let cursor = progress.cursor;
-    let total = progress.total;
-    if total <= 0 {
-        return Ok(format!(
-            "{} / {}",
-            format_with_commas(cursor.max(0) as u64),
-            total
-        ));
-    }
-
-    let percent = ((cursor.max(0) as f64 / total as f64) * 100.0).clamp(0.0, 100.0);
-    Ok(format!(
-        "{} / {} ({percent:.0}%)",
-        format_with_commas(cursor.max(0) as u64),
-        format_with_commas(total as u64)
-    ))
-}
-
-#[askama::filter_fn]
-pub fn job_progress_note(
-    val: &serde_json::Value,
-    _env: &dyn askama::Values,
-) -> askama::Result<String> {
-    Ok(progress_parts(val)
-        .and_then(|progress| progress.note)
-        .unwrap_or_default())
-}
-
-#[askama::filter_fn]
-pub fn job_progress_eta(
-    val: &serde_json::Value,
+pub fn job_progress(
+    state: &serde_json::Value,
     _env: &dyn askama::Values,
     started_at_micros: &Option<i64>,
-) -> askama::Result<String> {
-    Ok(progress_eta_s(
-        val,
+) -> askama::Result<Option<ProgressView>> {
+    Ok(ProgressView::from_state(
+        state,
         *started_at_micros,
         chrono::Utc::now().timestamp_micros(),
-    )
-    .map(format_duration_from_secs)
-    .unwrap_or_else(|| "—".to_string()))
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        SimpleArgPill, progress_eta_s, progress_parts, should_show_args_json, should_show_progress,
-        simple_args_for,
+        ProgressView, SimpleArgPill, progress_parts, should_show_args_json, simple_args_for,
     };
     use serde_json::json;
+
+    fn progress_eta_s(state: &serde_json::Value, started_at: Option<i64>, now: i64) -> Option<f64> {
+        super::progress_eta_s(&progress_parts(state)?, started_at, now)
+    }
+
+    fn should_show_progress(state: &serde_json::Value) -> bool {
+        ProgressView::from_state(state, None, 0).is_some()
+    }
+
+    #[test]
+    fn progress_view_formats_object_and_tuple_states_identically() {
+        let expected = ProgressView {
+            summary: "1,250 / 5,000 (25%)".to_string(),
+            percent: "25".to_string(),
+            note: "Importing".to_string(),
+            eta: "30.0s".to_string(),
+        };
+        for state in [
+            json!({"cursor": 1250, "total": 5000, "note": "Importing"}),
+            json!([1250, 5000, "Importing"]),
+        ] {
+            assert_eq!(
+                ProgressView::from_state(&state, Some(1_000_000), 11_000_000).as_ref(),
+                Some(&expected)
+            );
+        }
+    }
+
+    #[test]
+    fn progress_view_clamps_percent_and_preserves_unknown_eta() {
+        let negative = ProgressView::from_state(&json!([-1, 10]), None, 0).unwrap();
+        assert_eq!(negative.summary, "0 / 10 (0%)");
+        assert_eq!(negative.percent, "0");
+        assert_eq!(negative.eta, "—");
+        assert!(negative.note.is_empty());
+
+        let complete =
+            ProgressView::from_state(&json!([15, 10]), Some(1_000_000), 11_000_000).unwrap();
+        assert_eq!(complete.summary, "15 / 10 (100%)");
+        assert_eq!(complete.percent, "100");
+        assert_eq!(complete.eta, "0.0s");
+    }
 
     #[test]
     fn simple_args_include_top_level_scalar_values() {

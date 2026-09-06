@@ -5,36 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Queues - Oxana</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.32/dist/uPlot.min.css">
-    <script defer src="https://cdn.jsdelivr.net/npm/uplot@1.6.32/dist/uPlot.iife.min.js"></script>
-    <style>
-        .uplot {
-            color: #d1d5db;
-            background: transparent;
-        }
-        .chart-tooltip {
-            position: absolute;
-            z-index: 10;
-            min-width: 9rem;
-            pointer-events: none;
-            border: 1px solid #374151;
-            border-radius: 0.375rem;
-            background: rgba(17, 24, 39, 0.96);
-            color: #f9fafb;
-            padding: 0.5rem 0.625rem;
-            font-size: 0.75rem;
-            line-height: 1.25rem;
-            white-space: nowrap;
-            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.35);
-            transform: translate(-50%, -100%);
-        }
-        .chart-tooltip.hidden {
-            display: none;
-        }
-        .chart-tooltip-label {
-            color: #9ca3af;
-        }
-    </style>
+    {% let tooltip_min_width = 9 %}
+    {% include "_chart_head.html" %}
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
     <div class="max-w-[88rem] mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -127,161 +99,17 @@
         </div>
         {% endif %}
     </div>
+    {% include "_charts.html" %}
     <script>
         window.addEventListener('DOMContentLoaded', function () {
             if (typeof uPlot === 'undefined') {
                 return;
             }
 
-            function formatTime(ts) {
-                return new Date(ts * 1000).toLocaleString(undefined, {
-                    month: 'numeric',
-                    day: 'numeric',
-                    hour: 'numeric',
-                    minute: '2-digit'
-                });
-            }
-
-            function formatCount(value) {
-                return Math.round(value).toLocaleString();
-            }
-
-            var palette = [
-                '#60a5fa',
-                '#4ade80',
-                '#f472b6',
-                '#facc15',
-                '#a78bfa',
-                '#2dd4bf',
-                '#fb923c',
-                '#94a3b8'
-            ];
-
-            function seriesColor(index) {
-                return palette[index % palette.length];
-            }
-
-            function sortedSeriesRows(payload, idx) {
-                return payload.series.map(function (series, seriesIdx) {
-                    return {
-                        series: series,
-                        seriesIdx: seriesIdx,
-                        value: series.data[idx] || 0
-                    };
-                }).sort(function (a, b) {
-                    return (b.value - a.value) || (a.seriesIdx - b.seriesIdx);
-                });
-            }
-
-            function buildTooltip(chartEl, payload, formatter, options) {
-                options = options || {};
-                var tooltip = document.createElement('div');
-                tooltip.className = 'chart-tooltip hidden';
-                chartEl.appendChild(tooltip);
-
-                chartEl.addEventListener('mouseleave', function () {
-                    tooltip.classList.add('hidden');
-                });
-
-                return function (u) {
-                    var idx = u.cursor.idx;
-                    if (idx == null || idx < 0 || idx >= payload.timestamps.length) {
-                        tooltip.classList.add('hidden');
-                        return;
-                    }
-
-                    tooltip.replaceChildren();
-
-                    var time = document.createElement('div');
-                    var timeLabel = document.createElement('span');
-                    timeLabel.className = 'chart-tooltip-label';
-                    timeLabel.textContent = 'Time: ';
-                    time.appendChild(timeLabel);
-                    time.append(formatTime(payload.timestamps[idx]));
-                    tooltip.appendChild(time);
-
-                    sortedSeriesRows(payload, idx).filter(function (entry) {
-                        return options.includeZeroValues !== false || entry.value !== 0;
-                    }).forEach(function (entry) {
-                        var row = document.createElement('div');
-                        var label = document.createElement('span');
-                        label.className = 'chart-tooltip-label';
-                        label.textContent = entry.series.label + ': ';
-                        label.style.color = seriesColor(entry.seriesIdx);
-                        row.appendChild(label);
-                        row.append(formatter(entry.value));
-                        tooltip.appendChild(row);
-                    });
-
-                    tooltip.classList.remove('hidden');
-
-                    var x = u.over.offsetLeft + u.cursor.left;
-                    var y = u.over.offsetTop + u.cursor.top;
-                    var halfWidth = tooltip.offsetWidth / 2;
-                    var left = Math.min(Math.max(x, halfWidth + 8), chartEl.clientWidth - halfWidth - 8);
-                    var top = Math.max(y - 12, tooltip.offsetHeight + 8);
-
-                    tooltip.style.left = left + 'px';
-                    tooltip.style.top = top + 'px';
-                };
-            }
-
-            function renderChart(chartId, payload, valueFormatter, options) {
-                var chartEl = document.getElementById(chartId);
-                if (!chartEl) {
-                    return;
-                }
-
-                var data = [payload.timestamps].concat(payload.series.map(function (series) {
-                    return series.data;
-                }));
-
-                new uPlot({
-                    width: Math.max(chartEl.clientWidth, 320),
-                    height: 300,
-                    legend: { show: false },
-                    tzDate: function (ts) { return uPlot.tzDate(new Date(ts * 1e3), 'Etc/UTC'); },
-                    scales: {
-                        x: { time: true },
-                        y: { range: [0, null] }
-                    },
-                    axes: [
-                        {
-                            stroke: '#9ca3af',
-                            grid: { stroke: 'rgba(31, 41, 55, 0.7)' },
-                            ticks: { stroke: '#374151' }
-                        },
-                        {
-                            size: 72,
-                            stroke: '#9ca3af',
-                            grid: { stroke: 'rgba(31, 41, 55, 0.7)' },
-                            ticks: { stroke: '#374151' },
-                            values: function (_u, vals) {
-                                return vals.map(valueFormatter);
-                            }
-                        }
-                    ],
-                    series: [
-                        {}
-                    ].concat(payload.series.map(function (series, index) {
-                        return {
-                            label: series.label,
-                            stroke: seriesColor(index),
-                            width: 2
-                        };
-                    })),
-                    hooks: {
-                        setCursor: [buildTooltip(chartEl, payload, valueFormatter, options)]
-                    }
-                }, data, chartEl);
-            }
-
-            renderChart(
-                'queue-length-chart',
-                {{ self.queue_length_chart_data_json()|safe }},
-                formatCount,
-                { includeZeroValues: false }
-            );
+            var payload = {{ self.queue_length_chart_data_json()|safe }};
+            oxanaCharts.renderChart('queue-length-chart', payload, oxanaCharts.formatCount, function (idx) {
+                return oxanaCharts.seriesTooltipRows(payload, idx, oxanaCharts.formatCount);
+            });
         });
     </script>
 </body>

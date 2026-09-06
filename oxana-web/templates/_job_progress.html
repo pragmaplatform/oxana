@@ -3,18 +3,18 @@
         <div>
             <div class="text-xs font-medium text-cyan-200">Progress</div>
             <div class="mt-1 text-xs text-gray-400">
-                {{ state|job_progress_summary }}
+                {{ progress.summary }}
             </div>
         </div>
         <div class="shrink-0 text-right">
-            <div class="text-sm font-semibold text-cyan-200">{{ state|job_progress_percent }}%</div>
-            <div class="mt-1 text-[11px] text-cyan-200/70">ETA {{ state|job_progress_eta(progress_started_at) }}</div>
+            <div class="text-sm font-semibold text-cyan-200">{{ progress.percent }}%</div>
+            <div class="mt-1 text-[11px] text-cyan-200/70">ETA {{ progress.eta }}</div>
         </div>
     </div>
     <div class="mt-3 h-2 overflow-hidden rounded-full bg-gray-800">
-        <div class="h-full rounded-full bg-cyan-400 transition-all" style="width: {{ state|job_progress_percent }}%"></div>
+        <div class="h-full rounded-full bg-cyan-400 transition-all" style="width: {{ progress.percent }}%"></div>
     </div>
-    {% if state|job_progress_note != "" %}
-    <div class="mt-2 text-xs text-gray-300">{{ state|job_progress_note }}</div>
+    {% if progress.note != "" %}
+    <div class="mt-2 text-xs text-gray-300">{{ progress.note }}</div>
     {% endif %}
 </div>

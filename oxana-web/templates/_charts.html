@@ -1,0 +1,279 @@
+<script>
+const oxanaCharts = (function () {
+    function formatTime(ts) {
+        return new Date(ts * 1000).toLocaleString(undefined, {
+            month: 'numeric',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: '2-digit'
+        });
+    }
+
+    function formatCount(value) {
+        return Math.round(value).toLocaleString();
+    }
+
+    function formatShortTime(ts) {
+        return new Date(ts * 1000).toLocaleString(undefined, {
+            hour: 'numeric',
+            minute: '2-digit'
+        });
+    }
+
+    var palette = [
+        '#60a5fa', '#4ade80', '#f472b6', '#facc15',
+        '#a78bfa', '#2dd4bf', '#fb923c', '#94a3b8'
+    ];
+
+    function seriesColor(series, index) {
+        return series.color || palette[index % palette.length];
+    }
+
+    function seriesTooltipRows(payload, idx, formatter) {
+        return payload.series.map(function (series, seriesIdx) {
+            return { series: series, seriesIdx: seriesIdx, value: series.data[idx] || 0 };
+        }).sort(function (a, b) {
+            return (b.value - a.value) || (a.seriesIdx - b.seriesIdx);
+        }).filter(function (entry) {
+            return entry.value !== 0;
+        }).map(function (entry) {
+            return {
+                label: entry.series.fullLabel || entry.series.label,
+                value: formatter(entry.value),
+                color: seriesColor(entry.series, entry.seriesIdx)
+            };
+        });
+    }
+
+    function createTooltip(chartEl) {
+        var tooltip = document.createElement('div');
+        tooltip.className = 'chart-tooltip hidden';
+        chartEl.appendChild(tooltip);
+        return tooltip;
+    }
+
+    function fillTooltip(tooltip, timestamp, rows) {
+        tooltip.replaceChildren();
+        [{ label: 'Time', value: formatTime(timestamp) }].concat(rows).forEach(function (entry) {
+            var row = document.createElement('div');
+            var label = document.createElement('span');
+            label.className = 'chart-tooltip-label';
+            label.textContent = entry.label + ':';
+            if (entry.color) {
+                label.style.color = entry.color;
+            }
+            row.appendChild(label);
+            row.append(' ' + entry.value);
+            tooltip.appendChild(row);
+        });
+        tooltip.classList.remove('hidden');
+    }
+
+    function positionTooltip(chartEl, tooltip, x, y) {
+        var halfWidth = tooltip.offsetWidth / 2;
+        var left = Math.min(Math.max(x, halfWidth + 8), chartEl.clientWidth - halfWidth - 8);
+        var top = Math.max(y - 12, tooltip.offsetHeight + 8);
+        tooltip.style.left = left + 'px';
+        tooltip.style.top = top + 'px';
+    }
+
+    function buildTooltip(chartEl, timestamps, rowsForIndex) {
+        var tooltip = createTooltip(chartEl);
+        chartEl.addEventListener('mouseleave', function () {
+            tooltip.classList.add('hidden');
+        });
+        return function (u) {
+            var idx = u.cursor.idx;
+            if (idx == null || idx < 0 || idx >= timestamps.length) {
+                tooltip.classList.add('hidden');
+                return;
+            }
+            fillTooltip(tooltip, timestamps[idx], rowsForIndex(idx));
+            positionTooltip(chartEl, tooltip, u.over.offsetLeft + u.cursor.left, u.over.offsetTop + u.cursor.top);
+        };
+    }
+
+    function renderChart(chartId, payload, valueFormatter, rowsForIndex) {
+        var chartEl = document.getElementById(chartId);
+        if (!chartEl) {
+            return;
+        }
+
+        var data = [payload.timestamps].concat(payload.series.map(function (series) {
+            return series.data;
+        }));
+
+        new uPlot({
+            width: Math.max(chartEl.clientWidth, 320),
+            height: 300,
+            legend: { show: false },
+            tzDate: function (ts) { return uPlot.tzDate(new Date(ts * 1e3), 'Etc/UTC'); },
+            scales: {
+                x: { time: true },
+                y: { range: [0, null] }
+            },
+            axes: [
+                {
+                    stroke: '#9ca3af',
+                    grid: { stroke: 'rgba(31, 41, 55, 0.7)' },
+                    ticks: { stroke: '#374151' }
+                },
+                {
+                    size: 72,
+                    stroke: '#9ca3af',
+                    grid: { stroke: 'rgba(31, 41, 55, 0.7)' },
+                    ticks: { stroke: '#374151' },
+                    values: function (_u, vals) {
+                        return vals.map(valueFormatter);
+                    }
+                }
+            ],
+            series: [
+                {}
+            ].concat(payload.series.map(function (series, index) {
+                return {
+                    label: series.label,
+                    stroke: seriesColor(series, index),
+                    fill: series.fill,
+                    width: 2
+                };
+            })),
+            hooks: {
+                setCursor: [buildTooltip(chartEl, payload.timestamps, rowsForIndex)]
+            }
+        }, data, chartEl);
+    }
+
+    function svgEl(name) {
+        return document.createElementNS('http://www.w3.org/2000/svg', name);
+    }
+
+    function renderStackedChart(chartId, payload, ariaLabel, rowsForIndex) {
+        var chartEl = document.getElementById(chartId);
+        if (!chartEl) {
+            return;
+        }
+
+        var width = Math.max(chartEl.clientWidth, 320);
+        var height = 300;
+        var margin = { top: 12, right: 16, bottom: 44, left: 72 };
+        var plotWidth = width - margin.left - margin.right;
+        var plotHeight = height - margin.top - margin.bottom;
+        var timestamps = payload.timestamps;
+        var totals = timestamps.map(function (_ts, idx) {
+            return payload.series.reduce(function (sum, series) {
+                return sum + (series.data[idx] || 0);
+            }, 0);
+        });
+        var maxTotal = Math.max.apply(null, totals.concat([1]));
+        var barStep = plotWidth / Math.max(timestamps.length, 1);
+        var barWidth = Math.max(1, Math.min(18, barStep * 0.72));
+        var bottom = margin.top + plotHeight;
+
+        chartEl.replaceChildren();
+
+        var tooltip = createTooltip(chartEl);
+
+        var svg = svgEl('svg');
+        svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
+        svg.setAttribute('width', '100%');
+        svg.setAttribute('height', height.toString());
+        svg.setAttribute('role', 'img');
+        svg.setAttribute('aria-label', ariaLabel);
+        chartEl.appendChild(svg);
+
+        for (var tick = 0; tick <= 4; tick += 1) {
+            var value = Math.round((maxTotal * tick) / 4);
+            var y = bottom - (plotHeight * value / maxTotal);
+
+            var grid = svgEl('line');
+            grid.setAttribute('x1', margin.left.toString());
+            grid.setAttribute('x2', (width - margin.right).toString());
+            grid.setAttribute('y1', y.toString());
+            grid.setAttribute('y2', y.toString());
+            grid.setAttribute('stroke', 'rgba(31, 41, 55, 0.7)');
+            svg.appendChild(grid);
+
+            var label = svgEl('text');
+            label.setAttribute('x', (margin.left - 14).toString());
+            label.setAttribute('y', (y + 4).toString());
+            label.setAttribute('text-anchor', 'end');
+            label.setAttribute('fill', '#9ca3af');
+            label.setAttribute('font-size', '12');
+            label.textContent = formatCount(value);
+            svg.appendChild(label);
+        }
+
+        var xTickIndexes = Array.from(new Set([
+            0,
+            Math.floor((timestamps.length - 1) / 3),
+            Math.floor(((timestamps.length - 1) * 2) / 3),
+            timestamps.length - 1
+        ])).filter(function (idx) {
+            return idx >= 0 && idx < timestamps.length;
+        });
+
+        xTickIndexes.forEach(function (idx) {
+            var x = margin.left + (idx + 0.5) * barStep;
+            var label = svgEl('text');
+            label.setAttribute('x', x.toString());
+            label.setAttribute('y', (height - 14).toString());
+            label.setAttribute('text-anchor', 'middle');
+            label.setAttribute('fill', '#9ca3af');
+            label.setAttribute('font-size', '12');
+            label.textContent = formatShortTime(timestamps[idx]);
+            svg.appendChild(label);
+        });
+
+        function appendSegment(idx, value, offset, series, seriesIdx) {
+            if (value <= 0) {
+                return;
+            }
+
+            var segmentHeight = Math.max(1, plotHeight * value / maxTotal);
+            var y = bottom - (plotHeight * (offset + value) / maxTotal);
+            var rect = svgEl('rect');
+            rect.setAttribute('x', (margin.left + idx * barStep + (barStep - barWidth) / 2).toString());
+            rect.setAttribute('y', y.toString());
+            rect.setAttribute('width', barWidth.toString());
+            rect.setAttribute('height', segmentHeight.toString());
+            rect.setAttribute('fill', seriesColor(series, seriesIdx));
+            if (series.border) {
+                rect.setAttribute('stroke', series.border);
+                rect.setAttribute('stroke-width', '0.75');
+            }
+            svg.appendChild(rect);
+        }
+
+        timestamps.forEach(function (_ts, idx) {
+            var offset = 0;
+            payload.series.forEach(function (series, seriesIdx) {
+                var value = series.data[idx] || 0;
+                appendSegment(idx, value, offset, series, seriesIdx);
+                offset += value;
+            });
+        });
+
+        svg.addEventListener('mousemove', function (event) {
+            var rect = svg.getBoundingClientRect();
+            var localX = ((event.clientX - rect.left) / rect.width) * width;
+            var idx = Math.round((localX - margin.left) / barStep - 0.5);
+            idx = Math.max(0, Math.min(timestamps.length - 1, idx));
+
+            fillTooltip(tooltip, timestamps[idx], rowsForIndex(idx, totals[idx] || 0));
+            positionTooltip(chartEl, tooltip, event.clientX - rect.left, event.clientY - rect.top);
+        });
+
+        svg.addEventListener('mouseleave', function () {
+            tooltip.classList.add('hidden');
+        });
+    }
+
+    return {
+        renderChart: renderChart,
+        renderStackedChart: renderStackedChart,
+        seriesTooltipRows: seriesTooltipRows,
+        formatCount: formatCount
+    };
+})();
+</script>

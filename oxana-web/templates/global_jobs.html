@@ -16,15 +16,15 @@
 
         <div class="flex items-center justify-between mb-4">
             <h2 class="text-lg font-semibold">
-                {% if total > 0 %}
-                {{ self.range_start() }}&ndash;{{ self.range_end() }} of {{ total }} {{ kind.label() }}
+                {% if page.total > 0 %}
+                {{ page.range_start() }}&ndash;{{ page.range_end() }} of {{ page.total }} {{ kind.label() }}
                 {% else %}
                 0 {{ kind.label() }}
                 {% endif %}
             </h2>
             <div class="flex items-center gap-2 text-sm">
                 {% if kind.is_dead() %}
-                {% if total > 0 %}
+                {% if page.total > 0 %}
                 <form method="POST" action="{{ base_path }}/dead/revive_all" onsubmit="return confirmReviveAllDead()">
                     <button type="submit" class="px-3 py-1 rounded bg-green-900/50 border border-green-800 hover:bg-green-800 text-green-300 transition-colors">Revive All</button>
                 </form>
@@ -34,32 +34,32 @@
                 {% endif %}
                 {% endif %}
                 {% if kind.is_retries() %}
-                {% if total > 0 %}
+                {% if page.total > 0 %}
                 <form method="POST" action="{{ base_path }}/retries/retry_all_now" onsubmit="return confirmRetryAllNow()">
                     <button type="submit" class="px-3 py-1 rounded bg-orange-900/50 border border-orange-800 hover:bg-orange-800 text-orange-300 transition-colors">Retry All Now</button>
                 </form>
                 {% endif %}
                 {% endif %}
-                {% if page > 1 %}
-                <a href="?page={{ page - 1 }}" class="px-3 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-gray-300">&larr; Prev</a>
+                {% if page.number > 1 %}
+                <a href="?page={{ page.number - 1 }}" class="px-3 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-gray-300">&larr; Prev</a>
                 {% else %}
                 <span class="px-3 py-1 rounded bg-gray-900 border border-gray-800 text-gray-600 cursor-not-allowed">&larr; Prev</span>
                 {% endif %}
-                {% if has_next %}
-                <a href="?page={{ page + 1 }}" class="px-3 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-gray-300">Next &rarr;</a>
+                {% if page.has_next %}
+                <a href="?page={{ page.number + 1 }}" class="px-3 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-gray-300">Next &rarr;</a>
                 {% else %}
                 <span class="px-3 py-1 rounded bg-gray-900 border border-gray-800 text-gray-600 cursor-not-allowed">Next &rarr;</span>
                 {% endif %}
             </div>
         </div>
 
-        {% if jobs.is_empty() %}
+        {% if page.jobs.is_empty() %}
         <div class="bg-gray-900 border border-gray-800 rounded-lg p-6 text-center text-gray-500">
             {{ kind.empty_label() }}
         </div>
         {% else %}
         <div class="space-y-3">
-            {% for job in &jobs %}
+            {% for job in &page.jobs %}
             <div class="bg-gray-900 border {{ kind.border_class() }} rounded-lg p-4">
                 <div class="flex items-start justify-between mb-2">
                     <div class="flex items-center gap-2">
@@ -111,8 +111,8 @@
                 {% match job.meta.state %}
                 {% when Some with (state) %}
                 {% if state|has_args %}
-                {% if state|show_job_progress %}
                 {% let progress_started_at = job.meta.started_at %}
+                {% if let Some(progress) = state|job_progress(progress_started_at) %}
                 {% include "_job_progress.html" %}
                 {% else %}
                 <details class="mt-3">
@@ -151,13 +151,13 @@
         </div>
 
         <div class="flex items-center justify-between mt-6 text-sm">
-            <span class="text-gray-500">{{ self.range_start() }}&ndash;{{ self.range_end() }} of {{ total }}</span>
+            <span class="text-gray-500">{{ page.range_start() }}&ndash;{{ page.range_end() }} of {{ page.total }}</span>
             <div class="flex items-center gap-2">
-                {% if page > 1 %}
-                <a href="?page={{ page - 1 }}" class="px-3 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-gray-300">&larr; Prev</a>
+                {% if page.number > 1 %}
+                <a href="?page={{ page.number - 1 }}" class="px-3 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-gray-300">&larr; Prev</a>
                 {% endif %}
-                {% if has_next %}
-                <a href="?page={{ page + 1 }}" class="px-3 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-gray-300">Next &rarr;</a>
+                {% if page.has_next %}
+                <a href="?page={{ page.number + 1 }}" class="px-3 py-1 rounded bg-gray-800 border border-gray-700 hover:bg-gray-700 text-gray-300">Next &rarr;</a>
                 {% endif %}
             </div>
         </div>

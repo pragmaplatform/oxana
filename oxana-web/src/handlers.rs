@@ -6,9 +6,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-use crate::JOBS_PER_PAGE;
 use crate::OxanaWebState;
 use crate::error::OxanaWebError;
+use crate::pagination::JobPage;
 use crate::templates::{
     BusyTemplate, CronRow, CronTemplate, CronWorkerView, DashboardTemplate, GlobalJobsTemplate,
     JobDetailTemplate, JobListKind, MetricDetailTemplate, MetricsTemplate, OnDemandJobView,
@@ -188,52 +188,47 @@ pub(crate) async fn enqueue_on_demand_job(
     )))
 }
 
+async fn global_jobs(
+    state: OxanaWebState,
+    params: PaginationParams,
+    kind: JobListKind,
+) -> Result<GlobalJobsTemplate, OxanaWebError> {
+    let opts = JobPage::list_opts(params.page);
+    let (total, jobs) = match kind {
+        JobListKind::Scheduled => (
+            state.storage.scheduled_count().await?,
+            state.storage.list_scheduled(&opts).await?,
+        ),
+        JobListKind::Dead => (
+            state.storage.dead_count().await?,
+            state.storage.list_dead(&opts).await?,
+        ),
+        JobListKind::Retries => (
+            state.storage.retries_count().await?,
+            state.storage.list_retries(&opts).await?,
+        ),
+    };
+
+    Ok(GlobalJobsTemplate {
+        base_path: state.base_path,
+        active_tab: kind.path(),
+        kind,
+        page: JobPage::new(params.page, total, jobs),
+    })
+}
+
 pub(crate) async fn scheduled_jobs(
     Extension(state): Extension<OxanaWebState>,
     Query(params): Query<PaginationParams>,
 ) -> Result<GlobalJobsTemplate, OxanaWebError> {
-    let page = params.page.max(1);
-    let opts = list_opts(page);
-
-    let total = state.storage.scheduled_count().await?;
-    let mut jobs = state.storage.list_scheduled(&opts).await?;
-
-    let has_next = jobs.len() > JOBS_PER_PAGE;
-    jobs.truncate(JOBS_PER_PAGE);
-
-    Ok(GlobalJobsTemplate {
-        base_path: state.base_path,
-        active_tab: "/scheduled",
-        kind: JobListKind::Scheduled,
-        jobs,
-        page,
-        total,
-        has_next,
-    })
+    global_jobs(state, params, JobListKind::Scheduled).await
 }
 
 pub(crate) async fn dead_jobs(
     Extension(state): Extension<OxanaWebState>,
     Query(params): Query<PaginationParams>,
 ) -> Result<GlobalJobsTemplate, OxanaWebError> {
-    let page = params.page.max(1);
-    let opts = list_opts(page);
-
-    let total = state.storage.dead_count().await?;
-    let mut jobs = state.storage.list_dead(&opts).await?;
-
-    let has_next = jobs.len() > JOBS_PER_PAGE;
-    jobs.truncate(JOBS_PER_PAGE);
-
-    Ok(GlobalJobsTemplate {
-        base_path: state.base_path,
-        active_tab: "/dead",
-        kind: JobListKind::Dead,
-        jobs,
-        page,
-        total,
-        has_next,
-    })
+    global_jobs(state, params, JobListKind::Dead).await
 }
 
 pub(crate) async fn wipe_dead(
@@ -256,24 +251,7 @@ pub(crate) async fn retry_jobs(
     Extension(state): Extension<OxanaWebState>,
     Query(params): Query<PaginationParams>,
 ) -> Result<GlobalJobsTemplate, OxanaWebError> {
-    let page = params.page.max(1);
-    let opts = list_opts(page);
-
-    let total = state.storage.retries_count().await?;
-    let mut jobs = state.storage.list_retries(&opts).await?;
-
-    let has_next = jobs.len() > JOBS_PER_PAGE;
-    jobs.truncate(JOBS_PER_PAGE);
-
-    Ok(GlobalJobsTemplate {
-        base_path: state.base_path,
-        active_tab: "/retries",
-        kind: JobListKind::Retries,
-        jobs,
-        page,
-        total,
-        has_next,
-    })
+    global_jobs(state, params, JobListKind::Retries).await
 }
 
 pub(crate) async fn retry_all_now(
@@ -308,8 +286,7 @@ pub(crate) async fn queue_detail(
         return Ok(Redirect::to(&format!("{}/queues", state.base_path)).into_response());
     }
 
-    let page = params.page.max(1);
-    let opts = list_opts(page);
+    let opts = JobPage::list_opts(params.page);
 
     let stats = state.storage.stats().await?;
     let queue_config = queue_runtime_config_for(&state, &queue_key).await?;
@@ -318,7 +295,6 @@ pub(crate) async fn queue_detail(
         .enqueued_count(RawQueue::fixed(queue_key.clone()))
         .await?;
     let queue_stats = queue_detail_queue_stats(&stats, &queue_key, live_enqueued);
-    let total = live_enqueued;
     let active_jobs = stats
         .processing
         .iter()
@@ -327,13 +303,10 @@ pub(crate) async fn queue_detail(
         .collect::<Vec<_>>();
     let busy = active_jobs.len();
 
-    let mut jobs = state
+    let jobs = state
         .storage
         .list_queue_jobs(RawQueue::fixed(queue_key.clone()), &opts)
         .await?;
-
-    let has_next = jobs.len() > JOBS_PER_PAGE;
-    jobs.truncate(JOBS_PER_PAGE);
 
     Ok(QueueDetailTemplate {
         base_path: state.base_path,
@@ -343,10 +316,7 @@ pub(crate) async fn queue_detail(
         queue_config,
         active_jobs,
         busy,
-        jobs,
-        page,
-        total,
-        has_next,
+        page: JobPage::new(params.page, live_enqueued, jobs),
     }
     .into_response())
 }
@@ -664,13 +634,6 @@ pub(crate) struct OnDemandParams {
 pub(crate) struct CronParams {
     #[serde(default)]
     enqueued: Option<String>,
-}
-
-fn list_opts(page: usize) -> oxana::QueueListOpts {
-    oxana::QueueListOpts {
-        count: JOBS_PER_PAGE + 1,
-        offset: (page - 1) * JOBS_PER_PAGE,
-    }
 }
 
 async fn queue_config_map(
