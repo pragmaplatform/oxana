@@ -1685,6 +1685,27 @@ impl StorageInternal {
         })
     }
 
+    async fn poll_redis<T, F, Fut>(
+        &self,
+        cancel_token: CancellationToken,
+        poll_interval: Duration,
+        failure_tolerance: u32,
+        mut operation: F,
+    ) -> Result<(), OxanaError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, OxanaError>>,
+    {
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(poll_interval) => {
+                    self.track_redis_result(operation().await, failure_tolerance)?;
+                }
+            }
+        }
+    }
+
     pub async fn retry_loop(
         &self,
         cancel_token: CancellationToken,
@@ -1693,16 +1714,10 @@ impl StorageInternal {
     ) -> Result<(), OxanaError> {
         tracing::info!("Starting retry loop");
 
-        loop {
-            tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    return Ok(());
-                }
-                _ = tokio::time::sleep(poll_interval) => {
-                    self.track_redis_result(self.enqueue_scheduled(&self.keys.retry).await, failure_tolerance)?;
-                }
-            }
-        }
+        self.poll_redis(cancel_token, poll_interval, failure_tolerance, || {
+            self.enqueue_scheduled(&self.keys.retry)
+        })
+        .await
     }
 
     pub async fn schedule_loop(
@@ -1713,16 +1728,10 @@ impl StorageInternal {
     ) -> Result<(), OxanaError> {
         tracing::info!("Starting schedule loop");
 
-        loop {
-            tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    return Ok(());
-                }
-                _ = tokio::time::sleep(poll_interval) => {
-                    self.track_redis_result(self.enqueue_scheduled(&self.keys.schedule).await, failure_tolerance)?;
-                }
-            }
-        }
+        self.poll_redis(cancel_token, poll_interval, failure_tolerance, || {
+            self.enqueue_scheduled(&self.keys.schedule)
+        })
+        .await
     }
 
     pub async fn cleanup_loop(
@@ -1732,16 +1741,13 @@ impl StorageInternal {
     ) -> Result<(), OxanaError> {
         tracing::info!("Starting cleanup loop");
 
-        loop {
-            tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    return Ok(());
-                }
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(600)) => {
-                    self.track_redis_result(self.cleanup().await, failure_tolerance)?;
-                }
-            }
-        }
+        self.poll_redis(
+            cancel_token,
+            Duration::from_secs(600),
+            failure_tolerance,
+            || self.cleanup(),
+        )
+        .await
     }
 
     pub async fn ping_loop(
@@ -1750,16 +1756,10 @@ impl StorageInternal {
         heartbeat_interval: Duration,
         failure_tolerance: u32,
     ) -> Result<(), OxanaError> {
-        loop {
-            tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    return Ok(());
-                }
-                _ = tokio::time::sleep(heartbeat_interval) => {
-                    self.track_redis_result(self.ping().await, failure_tolerance)?;
-                }
-            }
-        }
+        self.poll_redis(cancel_token, heartbeat_interval, failure_tolerance, || {
+            self.ping()
+        })
+        .await
     }
 
     pub async fn ping(&self) -> Result<(), OxanaError> {
@@ -1885,16 +1885,10 @@ impl StorageInternal {
             tokio::time::sleep(scan_interval).await;
         }
 
-        loop {
-            tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    return Ok(());
-                }
-                _ = tokio::time::sleep(scan_interval) => {
-                    self.track_redis_result(self.resurrect(dead_process_threshold).await, failure_tolerance)?;
-                }
-            }
-        }
+        self.poll_redis(cancel_token, scan_interval, failure_tolerance, || {
+            self.resurrect(dead_process_threshold)
+        })
+        .await
     }
 
     pub async fn cron_job_loop<F>(
@@ -2315,6 +2309,7 @@ fn redis_metric_increment(value: u64) -> i64 {
 mod tests {
     use super::*;
     use crate::test_helper::{random_string, redis_pool};
+    use futures::FutureExt;
     use rand::RngExt;
     use serde::Serialize;
     use testresult::TestResult;
@@ -2323,6 +2318,98 @@ mod tests {
     struct TestJob {}
 
     impl crate::worker::Job for TestJob {}
+
+    #[tokio::test(start_paused = true)]
+    async fn polling_waits_before_each_operation_and_finishes_in_flight_work() -> TestResult {
+        let storage = crate::Storage::from_url("redis://127.0.0.1/0")?.internal;
+        let cancel = CancellationToken::new();
+        let calls = std::cell::Cell::new(0);
+        let poll = storage.poll_redis(cancel.clone(), Duration::from_secs(10), 3, || {
+            calls.set(calls.get() + 1);
+            async {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                Ok(())
+            }
+        });
+        tokio::pin!(poll);
+
+        assert!(poll.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(poll.as_mut().now_or_never().is_none());
+        assert_eq!(calls.get(), 0);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(poll.as_mut().now_or_never().is_none());
+        assert_eq!(calls.get(), 1);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(poll.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(poll.as_mut().now_or_never().is_none());
+        assert_eq!(calls.get(), 1);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(poll.as_mut().now_or_never().is_none());
+        assert_eq!(calls.get(), 2);
+        cancel.cancel();
+        assert!(poll.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(4)).await;
+        poll.await?;
+        assert_eq!(calls.get(), 2);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn polling_cancels_while_waiting_without_starting_an_operation() -> TestResult {
+        let storage = crate::Storage::from_url("redis://127.0.0.1/0")?.internal;
+        let cancel = CancellationToken::new();
+        let calls = std::cell::Cell::new(0);
+        let poll = storage.poll_redis(cancel.clone(), Duration::from_secs(10), 3, || {
+            calls.set(calls.get() + 1);
+            std::future::ready(Ok(()))
+        });
+        tokio::pin!(poll);
+
+        assert!(poll.as_mut().now_or_never().is_none());
+        cancel.cancel();
+        poll.await?;
+        assert_eq!(calls.get(), 0);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn polling_shares_failure_tracking_and_resets_it_after_success() -> TestResult {
+        let storage = crate::Storage::from_url("redis://127.0.0.1/0")?.internal;
+        let failure = || Err::<(), _>(OxanaError::GenericError("redis failure".to_string()));
+        assert!(storage.clone().track_redis_result(failure(), 2)?.is_none());
+
+        let calls = std::cell::Cell::new(0);
+        let result = storage
+            .poll_redis(CancellationToken::new(), Duration::from_secs(1), 2, || {
+                calls.set(calls.get() + 1);
+                std::future::ready(failure())
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1);
+
+        calls.set(0);
+        let mut successes = [true, false, true, false, false].into_iter();
+        let result = storage
+            .poll_redis(CancellationToken::new(), Duration::from_secs(1), 2, || {
+                calls.set(calls.get() + 1);
+                std::future::ready(
+                    if successes.next().expect("loop should stop at threshold") {
+                        Ok(())
+                    } else {
+                        failure()
+                    },
+                )
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 5);
+        Ok(())
+    }
 
     #[test]
     fn unique_cron_skips_an_observed_occurrence_if_it_vanishes_after_due() {
