@@ -461,36 +461,29 @@ async fn process_pending_batch<DT>(
     config: Arc<Runtime<DT>>,
     ctx: ContextValue<DT>,
     result_tx: mpsc::Sender<WorkerResult>,
-    pending: Vec<PendingJob>,
+    mut pending: Vec<PendingJob>,
 ) -> Result<(), OxanaError>
 where
     DT: Send + Sync + Clone + 'static,
 {
-    let mut envelopes = Vec::with_capacity(pending.len());
-    let mut permits = Vec::with_capacity(pending.len());
-    for pending_job in pending {
-        envelopes.push(pending_job.envelope);
-        permits.push(pending_job.permit);
-    }
-
-    let Some(first_envelope) = envelopes.first() else {
+    let Some(first_job) = pending.first() else {
         return Ok(());
     };
-    let worker_name = first_envelope.job.name.clone();
-    let args = envelopes
+    let worker_name = first_job.envelope.job.name.clone();
+    let args = pending
         .iter()
-        .map(|envelope| envelope.job.args.clone())
+        .map(|job| job.envelope.job.args.clone())
         .collect();
     let batch = match config.registry.build_batch(&worker_name, args, &ctx.0) {
         Ok(batch) => batch,
         Err(e) => {
             let err_msg = format!("Invalid job batch: {worker_name} - {e}");
             tracing::error!("{}", err_msg);
-            for envelope in &envelopes {
+            for job in &pending {
                 if let Err(e) = config
                     .storage
                     .internal
-                    .kill(envelope, err_msg.clone())
+                    .kill(&job.envelope, err_msg.clone())
                     .await
                 {
                     #[cfg(feature = "sentry")]
@@ -502,39 +495,38 @@ where
         }
     };
 
-    let invalid_by_index = invalid_jobs_by_index(batch.invalid, envelopes.len());
+    let invalid_by_index = invalid_jobs_by_index(batch.invalid, pending.len());
     if !invalid_by_index.is_empty() {
-        let mut valid_envelopes =
-            Vec::with_capacity(envelopes.len().saturating_sub(invalid_by_index.len()));
-        let mut valid_permits =
-            Vec::with_capacity(permits.len().saturating_sub(invalid_by_index.len()));
+        let mut valid = Vec::with_capacity(pending.len().saturating_sub(invalid_by_index.len()));
 
-        for (index, (envelope, permit)) in envelopes.into_iter().zip(permits).enumerate() {
+        for (index, job) in pending.into_iter().enumerate() {
             if let Some(error) = invalid_by_index.get(&index) {
                 let err_msg = format!("Invalid job: {worker_name} - {error}");
                 tracing::error!("{}", err_msg);
 
-                if let Err(e) = config.storage.internal.kill(&envelope, err_msg).await {
+                if let Err(e) = config.storage.internal.kill(&job.envelope, err_msg).await {
                     #[cfg(feature = "sentry")]
                     sentry_core::capture_error(&e);
                     tracing::error!("Failed to kill job: {}", e);
                 }
 
-                drop(permit);
+                drop(job.permit);
             } else {
-                valid_envelopes.push(envelope);
-                valid_permits.push(permit);
+                valid.push(job);
             }
         }
 
-        envelopes = valid_envelopes;
-        permits = valid_permits;
+        pending = valid;
     }
 
     let Some(job) = batch.job else {
         return Ok(());
     };
 
+    let (mut envelopes, permits): (Vec<_>, Vec<_>) = pending
+        .into_iter()
+        .map(|job| (job.envelope, job.permit))
+        .unzip();
     let outcome = executor::run_batch(Arc::clone(&config), job, &mut envelopes).await?;
     drop(permits);
     process_result(result_tx, outcome, envelopes).await;
@@ -808,7 +800,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use std::{sync::Arc, time::Duration};
     use testresult::TestResult;
-    use tokio::sync::mpsc;
+    use tokio::sync::{Mutex, mpsc};
 
     #[derive(Debug, Serialize, Deserialize)]
     struct UnsortedInvalidJob;
@@ -913,7 +905,137 @@ mod tests {
 
         assert_eq!(storage.dead_count().await?, 2);
         assert_eq!(storage.jobs_count().await?, 0);
+        assert_eq!(queue_controls.busy_count().await, 0);
 
+        Ok(())
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct PermitCheckJob {
+        value: usize,
+    }
+
+    impl Job for PermitCheckJob {}
+
+    #[derive(Clone)]
+    struct PermitCheckContext {
+        controls: Arc<QueueControlsMap>,
+        observed: Arc<Mutex<Vec<(usize, String)>>>,
+    }
+
+    struct PermitCheckWorker(PermitCheckContext);
+
+    impl crate::FromContext<PermitCheckContext> for PermitCheckWorker {
+        fn from_context(ctx: &PermitCheckContext) -> Self {
+            Self(ctx.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Worker<PermitCheckJob> for PermitCheckWorker {
+        type Error = std::io::Error;
+
+        async fn run_batch(
+            &self,
+            jobs: Vec<crate::BatchItem<PermitCheckJob>>,
+        ) -> Result<(), Self::Error> {
+            assert_eq!(self.0.controls.busy_count().await, jobs.len());
+            *self.0.observed.lock().await = jobs
+                .into_iter()
+                .map(|item| (item.job.value, item.ctx.meta.id))
+                .collect();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_preserves_job_context_order_and_permit_lifetimes() -> TestResult {
+        let storage = Storage::builder()
+            .namespace(random_string())
+            .build_from_pool(redis_pool().await?)?;
+        let queue = random_string();
+        let controls = Arc::new(QueueControlsMap::new());
+        let ctx = PermitCheckContext {
+            controls: Arc::clone(&controls),
+            observed: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut config = Config::new();
+        config.register_worker_with(WorkerConfig {
+            name: PermitCheckJob::name().to_string(),
+            legacy_names: Vec::new(),
+            factory: worker_registry::job_factory::<
+                PermitCheckWorker,
+                PermitCheckJob,
+                PermitCheckContext,
+            >,
+            batch_factory: |values, ctx| {
+                let mut batch = worker_registry::job_batch_factory::<
+                    PermitCheckWorker,
+                    PermitCheckJob,
+                    PermitCheckContext,
+                >(values, ctx)?;
+                batch.invalid.reverse();
+                batch.invalid.extend([
+                    InvalidBatchJob {
+                        index: 1,
+                        error: "duplicate index".to_string(),
+                    },
+                    InvalidBatchJob {
+                        index: usize::MAX,
+                        error: "out-of-range index".to_string(),
+                    },
+                ]);
+                Ok(batch)
+            },
+            batch_config: Some(crate::WorkerBatchConfig::new(4, Duration::from_millis(100))),
+            on_demand: None,
+            kind: WorkerConfigKind::Normal,
+        });
+
+        let control = controls
+            .get_or_create(queue.clone(), QueueRuntimeConfig::new(4))
+            .await;
+        let mut pending = Vec::new();
+        let mut expected = Vec::new();
+        for value in 0..4 {
+            let mut envelope = JobEnvelope::new(queue.clone(), PermitCheckJob { value })?;
+            if value % 2 == 0 {
+                expected.push((value, envelope.id.clone()));
+            } else {
+                envelope.job.args = serde_json::json!({"value": "invalid"});
+            }
+            storage.internal.enqueue(envelope.clone()).await?;
+            storage.internal.dequeue(&queue).await?;
+            pending.push(PendingJob {
+                envelope,
+                permit: control.acquire().await,
+            });
+        }
+        assert_eq!(controls.busy_count().await, 4);
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+
+        process_pending_batch(
+            Arc::new(Runtime::new(
+                storage.clone(),
+                config,
+                RuntimeSettings::new(),
+            )),
+            ContextValue::new(ctx.clone()),
+            result_tx,
+            pending,
+        )
+        .await?;
+
+        let result = result_rx.recv().await.expect("valid jobs should run");
+        assert!(matches!(
+            result.kind,
+            crate::result_collector::WorkerResultKind::Success
+        ));
+        assert_eq!(result.job_count, 2);
+        assert_eq!(*ctx.observed.lock().await, expected);
+        assert_eq!(controls.busy_count().await, 0);
+        assert_eq!(storage.dead_count().await?, 2);
+        assert_eq!(storage.jobs_count().await?, 0);
         Ok(())
     }
 
