@@ -15,18 +15,19 @@ use crate::{
     metrics::*,
     queue::{QueueRuntimeConfig, QueueState},
     result_collector::QueueResultStats,
-    stats::{
-        DynamicQueueStats, Process, QueueRateStats, QueueStats, Stats, StatsGlobal, StatsProcessing,
-    },
+    stats::{Process, QueueRateStats, QueueStats, Stats, StatsGlobal, StatsProcessing},
     storage_keys::StorageKeys,
     storage_types::QueueListOpts,
     worker_registry::CronJob,
 };
 
+mod queue_stats;
+
+use queue_stats::{aggregate_queue_stats, queue_rate_stats};
+
 const JOB_EXPIRE_TIME: i64 = 7 * 24 * 3600; // 7 days
 const SCAN_BATCH_SIZE: usize = 500;
 const ENQUEUE_LIST_CHUNK_SIZE: usize = 100;
-const QUEUE_LENGTH_SNAPSHOT_TTL_SECS: i64 = 120;
 
 #[derive(Debug, PartialEq, Eq)]
 enum UniqueCronAction {
@@ -77,12 +78,6 @@ enum JobEnqueueAction {
 enum JobDestination {
     Queue,
     Schedule,
-}
-
-#[derive(Default)]
-struct QueueLengthSnapshot {
-    enqueued: Option<i64>,
-    refreshed_at: Option<i64>,
 }
 
 struct QueueStatsInputs {
@@ -1168,127 +1163,17 @@ impl StorageInternal {
         let rate_minutes = metric_minutes(now, JobMetricsQuery::new(QUEUE_RATE_WINDOW_MINUTES));
         let inputs = self.queue_stats_inputs(redis, &rate_minutes).await?;
 
-        let mut map = HashMap::new();
-        let mut queue_values: Vec<(String, String, i64)> = Vec::new();
-        let mut queue_length_snapshots: HashMap<String, QueueLengthSnapshot> = HashMap::new();
-
-        for queue in queues {
-            queue_values.push((queue.clone(), "processed".to_string(), 0));
-        }
-
-        for (key, value) in inputs.stats {
-            let (queue_full_key, stat_key) = match Self::stats_key_parts(&key) {
-                Some(parts) => parts,
-                None => continue,
-            };
-
-            if filter && !Self::stats_key_matches_filter(queue_full_key, queues) {
-                continue;
-            }
-
-            match stat_key {
-                "enqueued" => {
-                    queue_length_snapshots
-                        .entry(queue_full_key.to_string())
-                        .or_default()
-                        .enqueued = Some(value);
-                }
-                "enqueued_at" => {
-                    queue_length_snapshots
-                        .entry(queue_full_key.to_string())
-                        .or_default()
-                        .refreshed_at = Some(value);
-                }
-                _ => {
-                    queue_values.push((queue_full_key.to_string(), stat_key.to_string(), value));
-                }
-            }
-        }
-
-        for (queue_full_key, stat_key, value) in queue_values {
-            let Some((queue_key, queue_dynamic_key)) = Self::split_queue_stats_key(&queue_full_key)
-            else {
-                continue;
-            };
-
-            let queue_stats = map
-                .entry(queue_key.to_string())
-                .or_insert_with(|| QueueStats {
-                    key: queue_key.to_string(),
-                    enqueued: 0,
-                    processed: 0,
-                    succeeded: 0,
-                    panicked: 0,
-                    failed: 0,
-                    latency_s: 0.0,
-                    rate: QueueRateStats::default(),
-                    queues: vec![],
-                });
-
-            if let Some(queue_dynamic_key) = queue_dynamic_key {
-                if !queue_stats
-                    .queues
-                    .iter_mut()
-                    .any(|q| q.suffix == queue_dynamic_key)
-                {
-                    queue_stats.queues.push(DynamicQueueStats {
-                        suffix: queue_dynamic_key.to_string(),
-                        enqueued: 0,
-                        processed: 0,
-                        succeeded: 0,
-                        panicked: 0,
-                        failed: 0,
-                        latency_s: 0.0,
-                        rate: QueueRateStats::default(),
-                    });
-                }
-
-                if let Some(existing) = queue_stats
-                    .queues
-                    .iter_mut()
-                    .find(|q| q.suffix == queue_dynamic_key)
-                {
-                    match stat_key.as_str() {
-                        "processed" => existing.processed += value,
-                        "succeeded" => existing.succeeded += value,
-                        "panicked" => existing.panicked += value,
-                        "failed" => existing.failed += value,
-                        _ => {}
-                    }
-                }
-            }
-
-            match stat_key.as_str() {
-                "processed" => queue_stats.processed += value,
-                "succeeded" => queue_stats.succeeded += value,
-                "panicked" => queue_stats.panicked += value,
-                "failed" => queue_stats.failed += value,
-                _ => {}
-            }
-        }
-
-        for queue_full_key in queue_length_snapshots.keys() {
-            if Self::fresh_queue_length_snapshot(&queue_length_snapshots, queue_full_key, now)
-                .is_some_and(|enqueued| enqueued > 0)
-            {
-                Self::ensure_queue_stats_entry(&mut map, queue_full_key);
-            }
-        }
-
-        let mut values: Vec<QueueStats> = map.into_values().collect();
+        let (mut values, enqueued_snapshots) =
+            aggregate_queue_stats(queues, inputs.stats, filter, now);
 
         for value in values.iter_mut() {
             if value.queues.is_empty() {
-                value.enqueued = match Self::fresh_queue_length_snapshot(
-                    &queue_length_snapshots,
-                    &value.key,
-                    now,
-                ) {
+                value.enqueued = match enqueued_snapshots.get(&value.key).copied() {
                     Some(enqueued) => enqueued,
                     None => self.enqueued_count_w_conn(redis, &value.key).await?,
                 };
                 value.latency_s = self.latency_s_w_conn(redis, &value.key).await?;
-                value.rate = Self::queue_rate_stats(
+                value.rate = queue_rate_stats(
                     &value.key,
                     value.enqueued,
                     &inputs.queue_length_rate_hashes,
@@ -1297,11 +1182,7 @@ impl StorageInternal {
             } else {
                 for dynamic_queue in value.queues.iter_mut() {
                     let dynamic_queue_key = format!("{}#{}", value.key, dynamic_queue.suffix);
-                    let enqueued = match Self::fresh_queue_length_snapshot(
-                        &queue_length_snapshots,
-                        &dynamic_queue_key,
-                        now,
-                    ) {
+                    let enqueued = match enqueued_snapshots.get(&dynamic_queue_key).copied() {
                         Some(enqueued) => enqueued,
                         None => {
                             self.enqueued_count_w_conn(redis, &dynamic_queue_key)
@@ -1312,7 +1193,7 @@ impl StorageInternal {
 
                     dynamic_queue.enqueued = enqueued;
                     dynamic_queue.latency_s = latency_s;
-                    dynamic_queue.rate = Self::queue_rate_stats(
+                    dynamic_queue.rate = queue_rate_stats(
                         &dynamic_queue_key,
                         dynamic_queue.enqueued,
                         &inputs.queue_length_rate_hashes,
@@ -1370,105 +1251,6 @@ impl StorageInternal {
             queue_length_rate_hashes,
             queue_counter_totals,
         })
-    }
-
-    fn stats_key_parts(key: &str) -> Option<(&str, &str)> {
-        key.rsplit_once(':')
-    }
-
-    fn split_queue_stats_key(queue_full_key: &str) -> Option<(&str, Option<&str>)> {
-        let mut queue_key_parts = queue_full_key.splitn(2, '#');
-        let queue_key = queue_key_parts.next()?;
-        Some((queue_key, queue_key_parts.next()))
-    }
-
-    fn ensure_queue_stats_entry(map: &mut HashMap<String, QueueStats>, queue_full_key: &str) {
-        let Some((queue_key, queue_dynamic_key)) = Self::split_queue_stats_key(queue_full_key)
-        else {
-            return;
-        };
-
-        let queue_stats = map
-            .entry(queue_key.to_string())
-            .or_insert_with(|| QueueStats {
-                key: queue_key.to_string(),
-                enqueued: 0,
-                processed: 0,
-                succeeded: 0,
-                panicked: 0,
-                failed: 0,
-                latency_s: 0.0,
-                rate: QueueRateStats::default(),
-                queues: vec![],
-            });
-
-        if let Some(queue_dynamic_key) = queue_dynamic_key
-            && !queue_stats
-                .queues
-                .iter()
-                .any(|q| q.suffix == queue_dynamic_key)
-        {
-            queue_stats.queues.push(DynamicQueueStats {
-                suffix: queue_dynamic_key.to_string(),
-                enqueued: 0,
-                processed: 0,
-                succeeded: 0,
-                panicked: 0,
-                failed: 0,
-                latency_s: 0.0,
-                rate: QueueRateStats::default(),
-            });
-        }
-    }
-
-    fn stats_key_matches_filter(queue_full_key: &str, queues: &[String]) -> bool {
-        let base_key = queue_full_key
-            .split_once('#')
-            .map_or(queue_full_key, |(base, _)| base);
-
-        queues.iter().any(|queue| {
-            let queue_base = queue
-                .split_once('#')
-                .map_or(queue.as_str(), |(base, _)| base);
-            queue_base == base_key || queue.as_str() == queue_full_key
-        })
-    }
-
-    fn fresh_queue_length_snapshot(
-        queue_length_snapshots: &HashMap<String, QueueLengthSnapshot>,
-        queue: &str,
-        now: i64,
-    ) -> Option<usize> {
-        let snapshot = queue_length_snapshots.get(queue)?;
-        let refreshed_at = snapshot.refreshed_at?;
-        if now.saturating_sub(refreshed_at) > QUEUE_LENGTH_SNAPSHOT_TTL_SECS {
-            return None;
-        }
-
-        usize::try_from(snapshot.enqueued?).ok()
-    }
-
-    fn queue_rate_stats(
-        queue: &str,
-        enqueued: usize,
-        queue_length_hashes: &[HashMap<String, i64>],
-        queue_counter_totals: &HashMap<String, QueueCounterTotals>,
-    ) -> QueueRateStats {
-        let window_start_enqueued = queue_length_hashes
-            .first()
-            .and_then(|hash| hash.get(queue))
-            .and_then(|value| usize::try_from(*value).ok())
-            .unwrap_or_default();
-        let counters = queue_counter_totals.get(queue).copied().unwrap_or_default();
-
-        QueueRateStats::calculate(
-            QUEUE_RATE_WINDOW_MINUTES,
-            enqueued,
-            window_start_enqueued,
-            counters.processed,
-            counters.succeeded,
-            counters.failed,
-        )
     }
 
     pub(crate) async fn flush_result_stats(
@@ -3278,7 +3060,7 @@ mod tests {
             .await?;
 
         let stale_refreshed_at =
-            chrono::Utc::now().timestamp() - QUEUE_LENGTH_SNAPSHOT_TTL_SECS - 1;
+            chrono::Utc::now().timestamp() - queue_stats::QUEUE_LENGTH_SNAPSHOT_TTL_SECS - 1;
         let mut redis = storage.connection().await?;
         let _: () = redis::pipe()
             .hset(&storage.keys.stats, format!("{queue}:enqueued"), 42)
