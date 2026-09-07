@@ -48,6 +48,7 @@ rand = "^0.10"
 sentry-core = { version = "=0.48.5", features = ["test"] }
 sentry-panic = "=0.48.5"
 testresult = "^0.4"
+tokio = { version = "^1.52", features = ["test-util"] }
 tracing-subscriber = { version = "^0.3", features = ["env-filter"] }
 trybuild = "1.0"
 
