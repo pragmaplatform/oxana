@@ -8,10 +8,10 @@ use tokio::time::MissedTickBehavior;
 use crate::WorkerBatchConfig;
 use crate::context::ContextValue;
 use crate::error::OxanaError;
-use crate::executor::{ExecutionError, ExecutionOutcome};
+use crate::executor::ExecutionOutcome;
 use crate::job_envelope::JobEnvelope;
 use crate::queue::{QueueConcurrency, QueueConfig, QueueKind, QueueRuntimeConfig};
-use crate::result_collector::{WorkerResult, WorkerResultKind};
+use crate::result_collector::WorkerResult;
 use crate::runtime::Runtime;
 use crate::semaphores_map::{QueueControlsMap, QueuePermit};
 use crate::worker_event::WorkerJob;
@@ -562,23 +562,18 @@ async fn process_result(
     outcome: ExecutionOutcome,
     envelopes: Vec<JobEnvelope>,
 ) {
-    let kind = match outcome.result {
-        Ok(()) => WorkerResultKind::Success,
-        Err(e) => match e {
-            ExecutionError::NotPanic => WorkerResultKind::Failed,
-            ExecutionError::Panic() => WorkerResultKind::Panicked,
-        },
-    };
-
     let job_count = u64::try_from(envelopes.len()).unwrap_or(u64::MAX);
     let Some(first_envelope) = envelopes.into_iter().next() else {
-        tracing::warn!("Worker result with no envelopes, dropping {:?}", kind);
+        tracing::warn!(
+            "Worker result with no envelopes, dropping {:?}",
+            outcome.kind
+        );
         return;
     };
 
     result_tx
         .send(WorkerResult {
-            kind,
+            kind: outcome.kind,
             worker_name: first_envelope.job.name,
             queue: first_envelope.queue,
             execution_ms: outcome.duration_ms,

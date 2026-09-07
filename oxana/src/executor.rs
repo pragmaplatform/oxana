@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::job_envelope::JobEnvelope;
 use crate::job_state::JobState;
+use crate::result_collector::WorkerResultKind;
 use crate::runtime::Runtime;
 use crate::worker::{BoxedProcessable, WorkerError};
 use crate::{
@@ -13,8 +14,9 @@ use crate::{
 
 #[derive(Debug)]
 enum ExecutionResult {
-    NotPanic(Result<(), WorkerError>),
-    Panic(String),
+    Success,
+    Failed(WorkerError),
+    Panicked(String),
 }
 
 struct ProcessResult {
@@ -22,13 +24,8 @@ struct ProcessResult {
     sentry_hub: crate::failure::ExecutionSentryHub,
 }
 
-pub(crate) enum ExecutionError {
-    NotPanic,
-    Panic(),
-}
-
 pub(crate) struct ExecutionOutcome {
-    pub(crate) result: Result<(), ExecutionError>,
+    pub(crate) kind: WorkerResultKind,
     pub(crate) duration_ms: u64,
 }
 
@@ -59,7 +56,7 @@ where
 {
     if envelopes.is_empty() {
         return Ok(ExecutionOutcome {
-            result: Ok(()),
+            kind: WorkerResultKind::Success,
             duration_ms: 0,
         });
     }
@@ -123,14 +120,14 @@ where
 
     let duration = start.elapsed();
     let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-    let is_err = !matches!(process_result.result, ExecutionResult::NotPanic(Ok(_)));
+    let success = matches!(process_result.result, ExecutionResult::Success);
     if envelopes.len() == 1 {
         tracing::info!(
             job_id = first_envelope.id,
             queue = queue,
             job = names.job,
             worker = names.worker,
-            success = !is_err,
+            success,
             duration = duration_ms,
             retries = first_envelope.meta.retries,
             "Job finished"
@@ -141,18 +138,15 @@ where
             queue = queue,
             job = names.job,
             worker = names.worker,
-            success = !is_err,
+            success,
             duration = duration_ms,
             "Job batch finished"
         );
     }
 
-    let result =
+    let kind =
         finish_batch_result(config.as_ref(), process_result, envelopes, &policies, names).await;
-    Ok(ExecutionOutcome {
-        result,
-        duration_ms,
-    })
+    Ok(ExecutionOutcome { kind, duration_ms })
 }
 
 struct JobExecutionPolicy {
@@ -179,8 +173,9 @@ async fn run_process(
     let future = AssertUnwindSafe(process(worker, job_contexts, envelope)).catch_unwind();
     let (result, sentry_hub) = crate::failure::with_execution_sentry_hub(future).await;
     let result = match result {
-        Ok(result) => ExecutionResult::NotPanic(result),
-        Err(panic) => ExecutionResult::Panic(panic_message(panic)),
+        Ok(Ok(())) => ExecutionResult::Success,
+        Ok(Err(error)) => ExecutionResult::Failed(error),
+        Err(panic) => ExecutionResult::Panicked(panic_message(panic)),
     };
     ProcessResult { result, sentry_hub }
 }
@@ -201,13 +196,13 @@ async fn finish_batch_result<DT>(
     envelopes: &[JobEnvelope],
     policies: &[JobExecutionPolicy],
     names: ExecutionNames,
-) -> Result<(), ExecutionError>
+) -> WorkerResultKind
 where
     DT: Send + Sync + Clone + 'static,
 {
     let ProcessResult { result, sentry_hub } = process_result;
     match result {
-        ExecutionResult::NotPanic(Ok(())) => {
+        ExecutionResult::Success => {
             if let Err(e) = config
                 .storage
                 .internal
@@ -216,9 +211,9 @@ where
             {
                 tracing::error!("Failed to finish job batch: {}", e);
             }
-            Ok(())
+            WorkerResultKind::Success
         }
-        ExecutionResult::NotPanic(Err(e)) => {
+        ExecutionResult::Failed(e) => {
             let failure_metadata = failure_metadata(envelopes, policies, names);
             config.settings.report_failure(
                 WorkerFailureReport {
@@ -260,9 +255,9 @@ where
                 .await;
             }
 
-            Err(ExecutionError::NotPanic)
+            WorkerResultKind::Failed
         }
-        ExecutionResult::Panic(panic_msg) => {
+        ExecutionResult::Panicked(panic_msg) => {
             let failure_metadata = failure_metadata(envelopes, policies, names);
             config.settings.report_failure(
                 WorkerFailureReport {
@@ -285,7 +280,7 @@ where
                 .await;
             }
 
-            Err(ExecutionError::Panic())
+            WorkerResultKind::Panicked
         }
     }
 }
