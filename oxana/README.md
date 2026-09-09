@@ -92,6 +92,10 @@ For more detailed usage examples, check out the [examples directory](https://git
 
 The `oxana-web` crate provides a built-in dashboard for monitoring jobs, queues, worker metrics, and cron schedules. It integrates as a nested axum router.
 
+[`oxana-web-topcoat`](../oxana-web-topcoat/README.md) provides the same dashboard
+with Topcoat routing and Rust views. It uses the same mounting API and requires
+Rust 1.98. Both dashboard crates can be used alongside each other.
+
 ```rust
 use oxana_web::OxanaWebState;
 

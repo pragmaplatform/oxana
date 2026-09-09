@@ -1,0 +1,373 @@
+use super::partials;
+use crate::{filters, models::*};
+use topcoat::{
+    context::Cx,
+    view::{Unescaped, View, view},
+};
+
+impl QueuesTemplate {
+    pub(crate) fn into_view(self, cx: &Cx) -> impl View + '_ {
+        view! {
+            cx =>
+            let base_path = &self.base_path;
+            let active_tab = self.active_tab;
+            let stats = &self.stats;
+            let queue_lengths = &self.queue_lengths;
+            let sort = &self.sort;
+            let dir = &self.dir;
+            <!DOCTYPE html>
+            <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta
+                        name="viewport"
+                        content="width=device-width, initial-scale=1.0"
+                    >
+                    <title>"Queues - Oxana"</title>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                    let tooltip_min_width = 9;
+                    partials::chart_head(tooltip_min_width: tooltip_min_width)
+                </head>
+                <body class="bg-gray-950 text-gray-100 min-h-screen">
+                    <div class="max-w-[88rem] mx-auto px-4 sm:px-6 lg:px-8 py-8">
+                        <div class="mb-6">
+                            <h1 class="text-2xl font-bold tracking-tight">
+                                "Oxana Dashboard"
+                            </h1>
+                        </div>
+                        partials::tabs(base_path: base_path, active_tab: active_tab)
+                        partials::stats_cards(base_path: base_path, stats: stats)
+                        <section class="mb-10">
+                            <div
+                                class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4"
+                            >
+                                <h2 class="text-lg font-semibold">"Queue Lengths"</h2>
+                                <form
+                                    method="GET"
+                                    action=(format!("{}/queues", base_path))
+                                    class="flex items-center gap-2 text-sm"
+                                >
+                                    <input type="hidden" name="sort" value=(sort)>
+                                    <input type="hidden" name="dir" value=(dir)>
+                                    <label for="minutes" class="text-gray-400">"Window"</label>
+                                    <select
+                                        id="minutes"
+                                        name="minutes"
+                                        class="bg-gray-900 border border-gray-800 rounded px-3 py-1.5 text-gray-200"
+                                        onchange="this.form.submit()"
+                                    >
+                                        <option
+                                            value="60"
+                                            if queue_lengths.minutes == 60 {
+                                                selected=(true)
+                                            }
+                                        >
+                                            "60 minutes"
+                                        </option>
+                                        <option
+                                            value="120"
+                                            if queue_lengths.minutes == 120 {
+                                                selected=(true)
+                                            }
+                                        >
+                                            "2 hours"
+                                        </option>
+                                        <option
+                                            value="240"
+                                            if queue_lengths.minutes == 240 {
+                                                selected=(true)
+                                            }
+                                        >
+                                            "4 hours"
+                                        </option>
+                                        <option
+                                            value="480"
+                                            if queue_lengths.minutes == 480 {
+                                                selected=(true)
+                                            }
+                                        >
+                                            "8 hours"
+                                        </option>
+                                    </select>
+                                </form>
+                            </div>
+                            <div
+                                class="relative bg-gray-900 border border-gray-800 rounded-lg p-4"
+                            >
+                                <div id="queue-length-chart" class="w-full h-[300px]"></div>
+                            </div>
+                        </section>
+                        <h2 class="text-lg font-semibold mb-4">
+                            "Queues ("
+                            (stats.queues.len())
+                            ")"
+                        </h2>
+                        if stats.queues.is_empty() {
+                            <div
+                                class="bg-gray-900 border border-gray-800 rounded-lg p-6 text-center text-gray-500"
+                            >
+                                " No queues "
+                            </div>
+                        } else {
+                            <div class="overflow-x-auto">
+                                <table class="w-full text-sm">
+                                    <thead>
+                                        <tr
+                                            class="border-b border-gray-800 text-left text-xs text-gray-400 uppercase tracking-wide"
+                                        >
+                                            <th class="pb-3 pr-4">
+                                                <a
+                                                    href=(self.sort_href("key"))
+                                                    class="hover:text-gray-200"
+                                                >
+                                                    "Queue"
+                                                    (self.sort_arrow("key"))
+                                                </a>
+                                            </th>
+                                            <th class="pb-3 pr-4 text-right">
+                                                <a
+                                                    href=(self.sort_href("concurrency"))
+                                                    class="hover:text-gray-200"
+                                                >
+                                                    "Concurrency"
+                                                    (self.sort_arrow("concurrency"))
+                                                </a>
+                                            </th>
+                                            <th class="pb-3 pr-4 text-right">
+                                                <a
+                                                    href=(self.sort_href("state"))
+                                                    class="hover:text-gray-200"
+                                                >
+                                                    "State"
+                                                    (self.sort_arrow("state"))
+                                                </a>
+                                            </th>
+                                            <th class="pb-3 pr-4 text-right">
+                                                <a
+                                                    href=(self.sort_href("enqueued"))
+                                                    class="hover:text-gray-200"
+                                                >
+                                                    "Enqueued"
+                                                    (self.sort_arrow("enqueued"))
+                                                </a>
+                                            </th>
+                                            <th class="pb-3 pr-4 text-right">
+                                                <a
+                                                    href=(self.sort_href("rate"))
+                                                    class="hover:text-gray-200"
+                                                >
+                                                    "Rate"
+                                                    (self.sort_arrow("rate"))
+                                                </a>
+                                            </th>
+                                            <th class="pb-3 pr-4 text-right">
+                                                <a
+                                                    href=(self.sort_href("eta"))
+                                                    class="hover:text-gray-200"
+                                                >
+                                                    "ETA"
+                                                    (self.sort_arrow("eta"))
+                                                </a>
+                                            </th>
+                                            <th class="pb-3 pr-4 text-right">
+                                                <a
+                                                    href=(self.sort_href("processed"))
+                                                    class="hover:text-gray-200"
+                                                >
+                                                    "Processed"
+                                                    (self.sort_arrow("processed"))
+                                                </a>
+                                            </th>
+                                            <th class="pb-3 pr-4 text-right">
+                                                <a
+                                                    href=(self.sort_href("succeeded"))
+                                                    class="hover:text-gray-200"
+                                                >
+                                                    "Succeeded"
+                                                    (self.sort_arrow("succeeded"))
+                                                </a>
+                                            </th>
+                                            <th class="pb-3 pr-4 text-right">
+                                                <a
+                                                    href=(self.sort_href("failed"))
+                                                    class="hover:text-gray-200"
+                                                >
+                                                    "Failed"
+                                                    (self.sort_arrow("failed"))
+                                                </a>
+                                            </th>
+                                            <th class="pb-3 pr-4 text-right">
+                                                <a
+                                                    href=(self.sort_href("panicked"))
+                                                    class="hover:text-gray-200"
+                                                >
+                                                    "Panicked"
+                                                    (self.sort_arrow("panicked"))
+                                                </a>
+                                            </th>
+                                            <th class="pb-3 text-right">
+                                                <a
+                                                    href=(self.sort_href("latency"))
+                                                    class="hover:text-gray-200"
+                                                >
+                                                    "Latency"
+                                                    (self.sort_arrow("latency"))
+                                                </a>
+                                            </th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        for queue in stats.queues.iter() {
+                                            <tr
+                                                class="border-b border-gray-800/50 hover:bg-gray-900/50"
+                                            >
+                                                <td class="py-3 pr-4 font-mono text-sm">
+                                                    if queue.queues.is_empty() {
+                                                        <a
+                                                            href=(format!(
+                                                                "{}/queues/{}",
+                                                                base_path,
+                                                                urlencoding::encode(&queue.key),
+                                                            ))
+                                                            class="text-blue-400 hover:text-blue-300 hover:underline"
+                                                        >
+                                                            (&queue.key)
+                                                        </a>
+                                                    } else {
+                                                        (&queue.key)
+                                                    }
+                                                </td>
+                                                <td class="py-3 pr-4 text-right text-gray-300">
+                                                    (self.concurrency_for(&queue.key))
+                                                    if self.has_concurrency_override_for(&queue.key) {
+                                                        " "
+                                                        <span class="text-gray-500">
+                                                            "("
+                                                            <span class="line-through">
+                                                                (self.default_concurrency_for(&queue.key))
+                                                            </span>
+                                                            ")"
+                                                        </span>
+                                                    }
+                                                </td>
+                                                <td
+                                                    class=(format!(
+                                                        "py-3 pr-4 text-right {}",
+                                                        self.state_class_for(&queue.key),
+                                                    ))
+                                                >
+                                                    (self.state_for(&queue.key))
+                                                </td>
+                                                <td class="py-3 pr-4 text-right text-blue-400">
+                                                    (&queue.enqueued)
+                                                </td>
+                                                <td class="py-3 pr-4 text-right text-cyan-400">
+                                                    (filters::format_rate_per_minute(
+                                                        &queue.rate.processed_per_minute,
+                                                    ))
+                                                </td>
+                                                <td class="py-3 pr-4 text-right text-yellow-400">
+                                                    (filters::format_eta_s(&queue.rate.eta_s))
+                                                </td>
+                                                <td class="py-3 pr-4 text-right text-green-400">
+                                                    (&queue.processed)
+                                                </td>
+                                                <td class="py-3 pr-4 text-right text-green-300">
+                                                    (&queue.succeeded)
+                                                </td>
+                                                <td class="py-3 pr-4 text-right text-red-400">
+                                                    (&queue.failed)
+                                                </td>
+                                                <td class="py-3 pr-4 text-right text-red-300">
+                                                    (&queue.panicked)
+                                                </td>
+                                                <td class="py-3 text-right text-purple-400">
+                                                    (filters::format_latency(&queue.latency_s))
+                                                </td>
+                                            </tr>
+                                            for dq in queue.queues.iter() {
+                                                let dq_key = self.dynamic_queue_key(&queue.key, &dq.suffix);
+                                                <tr
+                                                    class="border-b border-gray-800/50 hover:bg-gray-900/50 text-gray-500"
+                                                >
+                                                    <td class="py-2 pr-4 pl-10 font-mono text-xs">
+                                                        "↳ "
+                                                        <a
+                                                            href=(format!(
+                                                                "{}/queues/{}%23{}",
+                                                                base_path,
+                                                                queue.key,
+                                                                urlencoding::encode(&dq.suffix),
+                                                            ))
+                                                            class="text-blue-400 hover:text-blue-300 hover:underline"
+                                                        >
+                                                            (&dq.suffix)
+                                                        </a>
+                                                    </td>
+                                                    <td class="py-2 pr-4 text-right text-xs text-gray-400">
+                                                        (self.concurrency_for(&dq_key))
+                                                        if self.has_concurrency_override_for(&dq_key) {
+                                                            " "
+                                                            <span class="text-gray-600">
+                                                                "("
+                                                                <span class="line-through">
+                                                                    (self.default_concurrency_for(&dq_key))
+                                                                </span>
+                                                                ")"
+                                                            </span>
+                                                        }
+                                                    </td>
+                                                    <td
+                                                        class=(format!(
+                                                            "py-2 pr-4 text-right text-xs {}",
+                                                            self.state_class_for(&dq_key),
+                                                        ))
+                                                    >
+                                                        (self.state_for(&dq_key))
+                                                    </td>
+                                                    <td class="py-2 pr-4 text-right text-xs">
+                                                        (&dq.enqueued)
+                                                    </td>
+                                                    <td class="py-2 pr-4 text-right text-xs text-cyan-400">
+                                                        (filters::format_rate_per_minute(
+                                                            &dq.rate.processed_per_minute,
+                                                        ))
+                                                    </td>
+                                                    <td class="py-2 pr-4 text-right text-xs text-yellow-400">
+                                                        (filters::format_eta_s(&dq.rate.eta_s))
+                                                    </td>
+                                                    <td class="py-2 pr-4 text-right text-xs">
+                                                        (&dq.processed)
+                                                    </td>
+                                                    <td class="py-2 pr-4 text-right text-xs">
+                                                        (&dq.succeeded)
+                                                    </td>
+                                                    <td class="py-2 pr-4 text-right text-xs">(&dq.failed)</td>
+                                                    <td class="py-2 pr-4 text-right text-xs">
+                                                        (&dq.panicked)
+                                                    </td>
+                                                    <td class="py-2 text-right text-xs">
+                                                        (filters::format_latency(&dq.latency_s))
+                                                    </td>
+                                                </tr>
+                                            }
+                                        }
+                                    </tbody>
+                                </table>
+                            </div>
+                        }
+                    </div>
+                    <script>
+                        (Unescaped::new_unchecked(include_str!("../assets/charts.js")))
+                    </script>
+                    <script type="application/json" id="queues-data-0">
+                        (partials::chart_json(self.queue_length_chart_data_json()))
+                    </script>
+                    <script>
+                        (Unescaped::new_unchecked(include_str!("../assets/queues.js")))
+                    </script>
+                </body>
+            </html>
+        }
+    }
+}
