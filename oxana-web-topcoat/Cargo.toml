@@ -1,0 +1,36 @@
+[package]
+name = "oxana-web-topcoat"
+version = "2.1.4"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+description = "Topcoat web UI for Oxana job queue system."
+repository = "https://github.com/pragmaplatform/oxana"
+keywords = ["job", "scheduler", "worker", "web"]
+categories = ["asynchronous", "web-programming"]
+exclude = [".*", "logo.jpg"]
+
+[lib]
+doctest = false
+test = true
+
+[dependencies]
+oxana = { workspace = true }
+
+axum = "0.8"
+topcoat = { version = "=0.8.0", default-features = false, features = ["router", "tower"] }
+chrono = { version = "^0.4", features = ["serde"] }
+serde = { version = "^1.0", features = ["derive"] }
+serde_json = { version = "^1.0", features = ["preserve_order"] }
+urlencoding = "2"
+uuid = { version = "^1.23", features = ["v4"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+oxana = { path = "../oxana", default-features = false, features = [
+    "registry",
+] }
+serde = { version = "^1.0", features = ["derive"] }
+thiserror = "^2.0"
+tokio = { version = "^1.52", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }

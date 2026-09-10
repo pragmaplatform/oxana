@@ -42,6 +42,7 @@ jobs:
         run: |
           cargo test --lib --no-default-features
           cargo nextest run --all-features --no-fail-fast
+          cargo test -p oxana-web-topcoat --all-targets
 
       - name: Lint
         run: cargo clippy --all-features --workspace --all-targets -- -D warnings
