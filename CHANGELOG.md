@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.5] - 2026-09-10
+
+### Changed
+
+- Share dashboard chart, pagination, and progress rendering.
+- Simplify Redis background polling, worker execution outcomes, batch concurrency permit ownership, and queue statistics aggregation.
+
+### Fixed
+
+- Preserve future scheduled jobs during cleanup and give them the full retention window after they become due.
+
 ## [2.1.4] - 2026-08-31
 
 ### Added
