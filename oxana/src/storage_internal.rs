@@ -1583,7 +1583,13 @@ impl StorageInternal {
 
                     match parsed {
                         Ok(job_envelope) => {
-                            if job_envelope.meta.created_at_secs() < now - JOB_EXPIRE_TIME {
+                            // Give scheduled jobs the full retention window after they become due.
+                            let retention_start_secs = job_envelope
+                                .meta
+                                .created_at
+                                .max(job_envelope.meta.scheduled_at)
+                                / 1_000_000;
+                            if retention_start_secs < now - JOB_EXPIRE_TIME {
                                 job_ids.push(job_id);
                             }
                         }
@@ -2380,9 +2386,11 @@ mod tests {
         let mut expired_envelope1 = JobEnvelope::new(queue.clone(), TestJob {})?;
         expired_envelope1.meta.created_at =
             (chrono::Utc::now().timestamp() - JOB_EXPIRE_TIME - 1) * 1000000;
+        expired_envelope1.meta.scheduled_at = expired_envelope1.meta.created_at;
         let mut expired_envelope2 = JobEnvelope::new(queue.clone(), TestJob {})?;
         expired_envelope2.meta.created_at =
             (chrono::Utc::now().timestamp() - JOB_EXPIRE_TIME - 1) * 1000000;
+        expired_envelope2.meta.scheduled_at = 0;
 
         let active_envelope = JobEnvelope::new(queue.clone(), TestJob {})?;
 
@@ -2399,6 +2407,71 @@ mod tests {
         assert!(storage.get_job(&expired_envelope1.id).await?.is_none());
         assert!(storage.get_job(&expired_envelope2.id).await?.is_none());
         assert!(storage.get_job(&active_envelope.id).await?.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_preserves_future_scheduled_job_until_due() -> TestResult {
+        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let queue = random_string();
+        let now = chrono::Utc::now();
+        let created_at = now - chrono::Duration::days(8);
+        let scheduled_at = created_at + chrono::Duration::days(10);
+        let mut envelope = JobEnvelope::new_scheduled(queue.clone(), TestJob {}, scheduled_at)?;
+        envelope.meta.created_at = created_at.timestamp_micros();
+        storage.enqueue_at(envelope.clone()).await?;
+
+        assert_eq!(storage.cleanup().await?, 0);
+        assert!(storage.get_job(&envelope.id).await?.is_some());
+        assert_eq!(storage.scheduled_count().await?, 1);
+        assert_eq!(storage.enqueue_scheduled(&storage.keys.schedule).await?, 0);
+
+        // Move the scheduled time into the past to simulate the job becoming due.
+        envelope.meta.scheduled_at = (now - chrono::Duration::seconds(1)).timestamp_micros();
+        storage.update_jobs(std::slice::from_ref(&envelope)).await?;
+        let mut redis = storage.connection().await?;
+        let _: () = redis
+            .zadd(
+                &storage.keys.schedule,
+                &envelope.id,
+                envelope.meta.scheduled_at,
+            )
+            .await?;
+
+        assert_eq!(storage.cleanup().await?, 0);
+        assert_eq!(storage.enqueue_scheduled(&storage.keys.schedule).await?, 1);
+        assert_eq!(storage.scheduled_count().await?, 0);
+        assert_eq!(storage.cleanup().await?, 0);
+        assert_eq!(storage.dequeue(&queue).await?, Some(envelope.id.clone()));
+        assert!(storage.get_job(&envelope.id).await?.is_some());
+        storage.finish_with_success(&envelope).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_uses_later_creation_or_scheduled_time() -> TestResult {
+        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let queue = random_string();
+        let now = chrono::Utc::now();
+
+        for (created_days_ago, scheduled_days_ago, should_expire) in
+            [(10, 6, false), (6, 10, false), (10, 8, true)]
+        {
+            let mut envelope = JobEnvelope::new(queue.clone(), TestJob {})?;
+            envelope.meta.created_at =
+                (now - chrono::Duration::days(created_days_ago)).timestamp_micros();
+            envelope.meta.scheduled_at =
+                (now - chrono::Duration::days(scheduled_days_ago)).timestamp_micros();
+            storage.enqueue(envelope.clone()).await?;
+
+            assert_eq!(storage.cleanup().await?, usize::from(should_expire));
+            assert_eq!(
+                storage.get_job(&envelope.id).await?.is_none(),
+                should_expire
+            );
+        }
 
         Ok(())
     }
