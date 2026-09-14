@@ -113,6 +113,76 @@ pub async fn test_drain() -> TestResult {
     Ok(())
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct DrainSlowJob;
+
+impl oxana::Job for DrainSlowJob {}
+
+struct DrainSlowWorker;
+
+impl oxana::FromContext<()> for DrainSlowWorker {
+    fn from_context(_ctx: &()) -> Self {
+        Self
+    }
+}
+
+#[async_trait::async_trait]
+impl oxana::Worker<DrainSlowJob> for DrainSlowWorker {
+    type Error = WorkerError;
+
+    async fn run_batch(
+        &self,
+        _jobs: Vec<oxana::BatchItem<DrainSlowJob>>,
+    ) -> Result<(), WorkerError> {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        Ok(())
+    }
+}
+
+/// A drain holds a processing list for as long as a job runs. A worker sweeping
+/// the same namespace reads that list as a dead process's unless the drain is
+/// registered, and would put the job back on its queue while the drain still
+/// runs it.
+#[tokio::test]
+pub async fn test_drain_registers_its_process_while_jobs_run() -> TestResult {
+    let redis_pool = setup();
+    let storage = oxana::Storage::builder()
+        .namespace(random_string())
+        .build_from_pool(redis_pool)?;
+    let runtime = storage
+        .runtime(())
+        .queue::<QueueStatic>()
+        .worker::<DrainSlowWorker, DrainSlowJob>();
+
+    storage.enqueue(QueueStatic, DrainSlowJob).await?;
+    assert!(storage.processes().await?.is_empty());
+
+    let observed = storage.clone();
+    let observer = tokio::spawn(async move {
+        for _ in 0..40 {
+            if !observed.processes().await.unwrap_or_default().is_empty() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
+    });
+
+    let stats = runtime.drain(QueueStatic).await?;
+
+    assert_eq!(stats.succeeded, 1);
+    assert!(
+        observer.await?,
+        "the drain ran a job without registering its process"
+    );
+    assert!(
+        storage.processes().await?.is_empty(),
+        "the drain left its process record behind"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 pub async fn test_drain_uses_custom_error_formatter() -> TestResult {
     let redis_pool = setup();

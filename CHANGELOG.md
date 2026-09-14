@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Register the draining process while `RuntimeBuilder::drain` runs. `drain` claimed jobs without ever writing a process record, so its processing list looked like a dead process's to any worker sweeping the same namespace: the worker put the job back on its queue and ran it while the drain was still running it. `drain` now registers before it claims, heartbeats for as long as jobs run, and drops its record when it returns.
+
 ## [2.1.6] - 2026-09-14
 
 ### Fixed
