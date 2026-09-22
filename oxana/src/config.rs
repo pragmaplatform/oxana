@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::failure::{ExecutionSentryHub, FailureReporterFn, WorkerFailureReport, report_failure};
 use crate::queue::QueueConfig;
+use crate::runtime::ShutdownTimeoutReport;
 use crate::storage_types::{
     Catalog, CronWorkerInfo, OnDemandJobInfo, QueueInfo, QueueThrottleInfo, WorkerInfo,
 };
@@ -17,6 +18,7 @@ pub(crate) type RetryDelayOverrideFn =
     dyn Fn(&(dyn std::error::Error + Send + Sync + 'static), u32, u64) -> Option<u64> + Send + Sync;
 pub(crate) type ErrorFormatterFn =
     dyn Fn(&(dyn std::error::Error + Send + Sync + 'static)) -> String + Send + Sync;
+pub(crate) type ShutdownTimeoutReporterFn = dyn Fn(&ShutdownTimeoutReport) + Send + Sync;
 
 type ShutdownSignal =
     Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send + Sync + 'static>>;
@@ -29,6 +31,7 @@ pub(crate) struct RuntimeSettings {
     pub(crate) retry_delay_override: Option<Arc<RetryDelayOverrideFn>>,
     pub(crate) error_formatter: Option<Arc<ErrorFormatterFn>>,
     pub(crate) failure_reporter: Option<Arc<FailureReporterFn>>,
+    pub(crate) shutdown_timeout_reporter: Option<Arc<ShutdownTimeoutReporterFn>>,
     pub(crate) heartbeat_interval: Duration,
     pub(crate) dead_process_threshold: Duration,
     pub(crate) resurrect_scan_interval: Duration,
@@ -54,6 +57,7 @@ impl RuntimeSettings {
             retry_delay_override: None,
             error_formatter: None,
             failure_reporter: None,
+            shutdown_timeout_reporter: None,
             heartbeat_interval: Duration::from_millis(500),
             dead_process_threshold: DEFAULT_DEAD_PROCESS_THRESHOLD,
             resurrect_scan_interval: Duration::from_secs(2),

@@ -17,10 +17,12 @@ pub struct ThrottlerState {
 }
 
 impl Throttler {
-    pub fn new(redis_pool: deadpool_redis::Pool, key: &str, limit: u64, window_ms: i64) -> Self {
+    /// A throttler over the sorted set at `key`, which the storage builds from
+    /// its throttler prefix and the queue name.
+    pub fn new(redis_pool: deadpool_redis::Pool, key: String, limit: u64, window_ms: i64) -> Self {
         Throttler {
             redis_pool,
-            key: Self::build_key(key),
+            key,
             limit,
             window_ms,
         }
@@ -42,9 +44,11 @@ impl Throttler {
                 .map(|_| (current_time, Uuid::new_v4().to_string()))
                 .collect();
 
+            // The window is expressed in milliseconds; EXPIRE would round a
+            // sub-second window down to zero and a 1500ms window to a second.
             let mut pipe = redis::pipe();
             pipe.zadd_multiple(&self.key, &members)
-                .expire(&self.key, self.window_s());
+                .pexpire(&self.key, self.window_ms);
             let (updated, _): (u64, ()) = pipe.query_async(&mut redis).await?;
 
             Ok(ThrottlerState {
@@ -98,14 +102,6 @@ impl Throttler {
         })
     }
 
-    fn build_key(key: &str) -> String {
-        format!("oxana:throttler:{key}")
-    }
-
-    fn window_s(&self) -> i64 {
-        self.window_ms / 1000
-    }
-
     fn window_micros(&self) -> i64 {
         self.window_ms * 1000
     }
@@ -115,13 +111,15 @@ impl Throttler {
 mod tests {
     use super::*;
     use crate::test_helper::*;
+    use deadpool_redis::redis::AsyncCommands;
+    use std::time::Duration;
     use testresult::TestResult;
 
     #[tokio::test]
     async fn test_consume() -> TestResult {
         let pool = redis_pool().await?;
         let key = random_string();
-        let rate_limiter = Throttler::new(pool, &key, 2, 60000);
+        let rate_limiter = Throttler::new(pool, key, 2, 60000);
         assert!(rate_limiter.consume(None).await?.is_allowed);
         assert!(rate_limiter.consume(None).await?.is_allowed);
         let state = rate_limiter.consume(None).await?;
@@ -137,10 +135,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sub_second_window_still_limits() -> TestResult {
+        let pool = redis_pool().await?;
+        let key = random_string();
+        let rate_limiter = Throttler::new(pool.clone(), key.clone(), 1, 500);
+        assert!(rate_limiter.consume(None).await?.is_allowed);
+
+        // The window is stored with millisecond precision: a 500ms window
+        // must neither expire at once nor be rounded down to zero.
+        let ttl_ms: i64 = pool.get().await?.pttl(&key).await?;
+        assert!((1..=500).contains(&ttl_ms), "ttl was {ttl_ms}ms");
+
+        let state = rate_limiter.consume(None).await?;
+        assert!(!state.is_allowed);
+        assert!(
+            state
+                .throttled_for
+                .is_some_and(|ms| (1..1000).contains(&ms))
+        );
+
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        assert!(rate_limiter.consume(None).await?.is_allowed);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn window_keeps_its_fractional_second() -> TestResult {
+        let pool = redis_pool().await?;
+        let key = random_string();
+        let rate_limiter = Throttler::new(pool.clone(), key.clone(), 1, 1500);
+        assert!(rate_limiter.consume(None).await?.is_allowed);
+
+        let ttl_ms: i64 = pool.get().await?.pttl(&key).await?;
+        assert!((1001..=1500).contains(&ttl_ms), "ttl was {ttl_ms}ms");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_consume_with_cost() -> TestResult {
         let pool = redis_pool().await?;
         let key = random_string();
-        let rate_limiter = Throttler::new(pool, &key, 4, 60000);
+        let rate_limiter = Throttler::new(pool, key, 4, 60000);
         assert!(rate_limiter.consume(Some(2)).await?.is_allowed);
         assert!(rate_limiter.consume(Some(2)).await?.is_allowed);
         let state = rate_limiter.consume(Some(1)).await?;

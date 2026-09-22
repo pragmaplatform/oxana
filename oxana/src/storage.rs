@@ -17,7 +17,7 @@ use crate::{
     stats::{Process, QueueStats, Stats},
     storage_builder::StorageBuilder,
     storage_internal::StorageInternal,
-    storage_types::QueueListOpts,
+    storage_types::{EnqueueOutcome, QueueListOpts},
     worker::Job,
 };
 
@@ -137,6 +137,34 @@ impl Storage {
         self.enqueue_in(queue, job, 0).await
     }
 
+    /// Enqueues a job to be processed immediately, reporting what happened.
+    ///
+    /// Like [`enqueue`](Self::enqueue), but the [`EnqueueOutcome`] tells a filed
+    /// job from a unique job that was skipped or replaced, where the job ID
+    /// alone cannot. The uniqueness check and the write happen in one Redis
+    /// step, so concurrent pushes on one unique ID file exactly one job.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use oxana::{EnqueueOutcome, Storage, Queue, Job};
+    ///
+    /// async fn example(storage: &Storage) -> Result<(), oxana::OxanaError> {
+    ///     match storage.try_enqueue(MyQueue, MyJob { data: "hello" }).await? {
+    ///         EnqueueOutcome::Duplicate { existing } => println!("already filed as {existing}"),
+    ///         outcome => println!("filed as {}", outcome.job_id()),
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn try_enqueue<T: Job + 'static>(
+        &self,
+        queue: impl Queue,
+        job: T,
+    ) -> Result<EnqueueOutcome, OxanaError> {
+        self.try_enqueue_in(queue, job, 0).await
+    }
+
     /// Enqueues multiple jobs to the same queue for immediate processing.
     ///
     /// The returned job IDs are in the same order as the input jobs. Unique-job
@@ -181,6 +209,28 @@ impl Storage {
         T: Job + 'static,
         Jobs: IntoIterator<Item = T>,
     {
+        Ok(self
+            .try_enqueue_list(queue, jobs)
+            .await?
+            .into_iter()
+            .map(EnqueueOutcome::into_job_id)
+            .collect())
+    }
+
+    /// Enqueues multiple jobs to the same queue, reporting what happened to
+    /// each.
+    ///
+    /// Like [`enqueue_list`](Self::enqueue_list), with one [`EnqueueOutcome`]
+    /// per input job, in order.
+    pub async fn try_enqueue_list<T, Jobs>(
+        &self,
+        queue: impl Queue,
+        jobs: Jobs,
+    ) -> Result<Vec<EnqueueOutcome>, OxanaError>
+    where
+        T: Job + 'static,
+        Jobs: IntoIterator<Item = T>,
+    {
         let queue_key = queue.key();
         let envelopes = jobs
             .into_iter()
@@ -193,7 +243,7 @@ impl Storage {
             "Enqueuing job list"
         );
 
-        self.internal.enqueue_list(envelopes).await
+        self.internal.try_enqueue_list(envelopes).await
     }
 
     /// Enqueues a job to be processed after a specified delay.
@@ -225,15 +275,27 @@ impl Storage {
         job: T,
         delay: u64,
     ) -> Result<JobId, OxanaError> {
+        self.try_enqueue_in(queue, job, delay)
+            .await
+            .map(EnqueueOutcome::into_job_id)
+    }
+
+    /// Enqueues a job to be processed after a delay in seconds, reporting what
+    /// happened.
+    ///
+    /// Like [`enqueue_in`](Self::enqueue_in), with the [`EnqueueOutcome`] of
+    /// [`try_enqueue`](Self::try_enqueue).
+    pub async fn try_enqueue_in<T: Job + 'static>(
+        &self,
+        queue: impl Queue,
+        job: T,
+        delay: u64,
+    ) -> Result<EnqueueOutcome, OxanaError> {
         let envelope = JobEnvelope::new(queue.key().clone(), job)?;
 
         tracing::trace!("Enqueuing job: {:?}", envelope);
 
-        if delay > 0 {
-            self.internal.enqueue_in(envelope, delay).await
-        } else {
-            self.internal.enqueue(envelope).await
-        }
+        self.internal.try_enqueue_in(envelope, delay).await
     }
 
     /// Schedules a job to run at a specific time.
@@ -266,11 +328,26 @@ impl Storage {
         job: T,
         time: DateTime<Utc>,
     ) -> Result<JobId, OxanaError> {
+        self.try_enqueue_at(queue, job, time)
+            .await
+            .map(EnqueueOutcome::into_job_id)
+    }
+
+    /// Schedules a job to run at a specific time, reporting what happened.
+    ///
+    /// Like [`enqueue_at`](Self::enqueue_at), with the [`EnqueueOutcome`] of
+    /// [`try_enqueue`](Self::try_enqueue).
+    pub async fn try_enqueue_at<T: Job + 'static>(
+        &self,
+        queue: impl Queue,
+        job: T,
+        time: DateTime<Utc>,
+    ) -> Result<EnqueueOutcome, OxanaError> {
         let envelope = JobEnvelope::new_scheduled(queue.key().clone(), job, time)?;
 
         tracing::trace!("Scheduling job {:?} at {}", envelope, time);
 
-        self.internal.enqueue_at(envelope).await
+        self.internal.try_enqueue_at(envelope).await
     }
 
     /// Returns the number of jobs currently enqueued in the specified queue.
@@ -677,6 +754,17 @@ impl Storage {
     /// The [`JobId`] of the enqueued job, or an [`OxanaError`] if the operation fails.
     pub async fn enqueue_envelope(&self, envelope: JobEnvelope) -> Result<JobId, OxanaError> {
         self.internal.enqueue(envelope).await
+    }
+
+    /// Enqueues a raw job envelope, reporting what happened.
+    ///
+    /// Like [`enqueue_envelope`](Self::enqueue_envelope), with the
+    /// [`EnqueueOutcome`] of [`try_enqueue`](Self::try_enqueue).
+    pub async fn try_enqueue_envelope(
+        &self,
+        envelope: JobEnvelope,
+    ) -> Result<EnqueueOutcome, OxanaError> {
+        self.internal.try_enqueue(envelope).await
     }
 
     /// Removes all jobs from the specified queue.

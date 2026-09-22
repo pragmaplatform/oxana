@@ -70,6 +70,10 @@ pub fn derive_job(input: TokenStream) -> TokenStream {
 /// #[oxana(batch_size = 10, batch_timeout_ms = 500)]
 /// struct TestWorkerUniqueId;
 /// ```
+///
+/// `classify = path` names a `fn(&Worker, &Job, &Error) -> oxana::FailureKind`
+/// that decides, once an attempt has failed, whether the job is retried or
+/// dead-lettered at once (`Worker::classify`).
 #[proc_macro_error]
 #[proc_macro_derive(Worker, attributes(oxana))]
 pub fn derive_worker(input: TokenStream) -> TokenStream {

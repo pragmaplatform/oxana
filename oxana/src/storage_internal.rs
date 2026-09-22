@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     num::NonZero,
     sync::Arc,
+    sync::LazyLock,
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
@@ -17,7 +18,8 @@ use crate::{
     result_collector::QueueResultStats,
     stats::{Process, QueueRateStats, QueueStats, Stats, StatsGlobal, StatsProcessing},
     storage_keys::StorageKeys,
-    storage_types::QueueListOpts,
+    storage_types::{EnqueueOutcome, QueueListOpts},
+    throttler::Throttler,
     worker_registry::CronJob,
 };
 
@@ -29,6 +31,93 @@ const JOB_EXPIRE_TIME: i64 = 7 * 24 * 3600; // 7 days
 const SCAN_BATCH_SIZE: usize = 500;
 const STATS_READ_BATCH_SIZE: usize = 500;
 const ENQUEUE_LIST_CHUNK_SIZE: usize = 100;
+/// How many times a replacing push re-reads a unique job that keeps moving
+/// queues under it before giving up.
+const ENQUEUE_REPLACE_ATTEMPTS: u32 = 8;
+
+/// Stores a job and files it, checking uniqueness in the same step.
+///
+/// A unique job is skipped when its ID is already stored, or replaced when it
+/// asks to be: its old queue and schedule memberships are removed first. The
+/// old queue is read by the caller and verified here, so a job that moved in
+/// between is reported as `moved` rather than left on two queues.
+///
+/// KEYS: jobs hash, destination (queue list or schedule zset), schedule zset,
+/// retry zset, the existing job's queue list, the pushed job's queue list.
+/// ARGV: job id, serialized envelope, destination kind (`queue`/`schedule`),
+/// schedule score, unique flag (`1`/`0`), conflict strategy
+/// (`skip`/`replace`), the queue name the existing job is expected on.
+static ENQUEUE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+    redis::Script::new(
+        r"
+        local raw = redis.call('HGET', KEYS[1], ARGV[1])
+        local outcome = 'enqueued'
+        if raw and ARGV[5] == '1' then
+            if ARGV[6] ~= 'replace' then
+                return 'duplicate'
+            end
+            if cjson.decode(raw)['queue'] ~= ARGV[7] then
+                return 'moved'
+            end
+            redis.call('ZREM', KEYS[3], ARGV[1])
+            redis.call('ZREM', KEYS[4], ARGV[1])
+            redis.call('LREM', KEYS[5], 0, ARGV[1])
+            redis.call('LREM', KEYS[6], 0, ARGV[1])
+            outcome = 'replaced'
+        end
+        redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+        if ARGV[3] == 'schedule' then
+            redis.call('ZADD', KEYS[2], ARGV[4], ARGV[1])
+        else
+            redis.call('LPUSH', KEYS[2], ARGV[1])
+        end
+        return outcome
+        ",
+    )
+});
+
+/// Moves due jobs from a schedule to their queue, claiming and filing each in
+/// the same step. Ids already claimed by another promoter are skipped.
+///
+/// KEYS: schedule zset, queue list. ARGV: job ids, oldest first.
+static PROMOTE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
+    redis::Script::new(
+        r"
+        local promoted = 0
+        for i = 1, #ARGV do
+            if redis.call('ZREM', KEYS[1], ARGV[i]) == 1 then
+                redis.call('LPUSH', KEYS[2], ARGV[i])
+                promoted = promoted + 1
+            end
+        end
+        return promoted
+        ",
+    )
+});
+
+/// Maps an enqueue script reply to an outcome; `None` asks for another attempt.
+fn enqueue_reply(
+    envelope: &JobEnvelope,
+    reply: &str,
+) -> Result<Option<EnqueueOutcome>, OxanaError> {
+    match reply {
+        "enqueued" => Ok(Some(EnqueueOutcome::Enqueued(envelope.id.clone()))),
+        "replaced" => {
+            tracing::warn!("Unique job {} already exists, replacing", envelope.id);
+            Ok(Some(EnqueueOutcome::Replaced(envelope.id.clone())))
+        }
+        "duplicate" => {
+            tracing::warn!("Unique job {} already exists, skipping", envelope.id);
+            Ok(Some(EnqueueOutcome::Duplicate {
+                existing: envelope.id.clone(),
+            }))
+        }
+        "moved" => Ok(None),
+        other => Err(OxanaError::GenericError(format!(
+            "Unexpected enqueue script reply: {other}"
+        ))),
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum UniqueCronAction {
@@ -70,12 +159,6 @@ pub(crate) struct StorageInternal {
     consecutive_redis_failures: Arc<AtomicU32>,
 }
 
-enum JobEnqueueAction {
-    Default,
-    Skip,
-    Replace { existing_queue: String },
-}
-
 #[derive(Clone, Copy)]
 enum JobDestination {
     Queue,
@@ -89,24 +172,28 @@ struct QueueStatsInputs {
 }
 
 impl StorageInternal {
-    pub fn new(pool: deadpool_redis::Pool, namespace: Option<String>) -> Self {
-        Self::with_optional_stats_pool(pool, None, namespace)
+    pub fn new(pool: deadpool_redis::Pool, keys: StorageKeys) -> Self {
+        Self::with_optional_stats_pool(pool, None, keys)
+    }
+
+    #[cfg(test)]
+    pub fn with_namespace(pool: deadpool_redis::Pool, namespace: impl Into<String>) -> Self {
+        Self::new(pool, StorageKeys::new(namespace))
     }
 
     pub fn with_stats_pool(
         pool: deadpool_redis::Pool,
         stats_pool: deadpool_redis::Pool,
-        namespace: Option<String>,
+        keys: StorageKeys,
     ) -> Self {
-        Self::with_optional_stats_pool(pool, Some(stats_pool), namespace)
+        Self::with_optional_stats_pool(pool, Some(stats_pool), keys)
     }
 
     fn with_optional_stats_pool(
         pool: deadpool_redis::Pool,
         stats_pool: Option<deadpool_redis::Pool>,
-        namespace: Option<String>,
+        keys: StorageKeys,
     ) -> Self {
-        let keys = StorageKeys::new(namespace.unwrap_or_default());
         Self {
             pool,
             stats_pool,
@@ -117,12 +204,22 @@ impl StorageInternal {
         }
     }
 
-    /// Shares the pools and namespace with a new process identity.
+    /// Shares the pools and key layout with a new process identity.
     pub fn for_new_process(&self) -> Self {
         Self::with_optional_stats_pool(
             self.pool.clone(),
             self.stats_pool.clone(),
-            Some(self.keys.namespace.clone()),
+            self.keys.clone(),
+        )
+    }
+
+    /// A throttler over this storage's window for the given queue.
+    pub(crate) fn throttler(&self, queue_key: &str, limit: u64, window_ms: i64) -> Throttler {
+        Throttler::new(
+            self.pool.clone(),
+            format!("{}:{queue_key}", self.keys.throttler_prefix),
+            limit,
+            window_ms,
         )
     }
 
@@ -171,10 +268,6 @@ impl StorageInternal {
     #[cfg(test)]
     pub(crate) fn has_dedicated_stats_pool(&self) -> bool {
         self.stats_pool.is_some()
-    }
-
-    pub async fn pool(&self) -> Result<deadpool_redis::Pool, OxanaError> {
-        Ok(self.pool.clone())
     }
 
     pub async fn connection(&self) -> Result<deadpool_redis::Connection, OxanaError> {
@@ -329,15 +422,21 @@ impl StorageInternal {
     }
 
     pub async fn enqueue(&self, envelope: JobEnvelope) -> Result<JobId, OxanaError> {
+        self.try_enqueue(envelope)
+            .await
+            .map(EnqueueOutcome::into_job_id)
+    }
+
+    pub async fn try_enqueue(&self, envelope: JobEnvelope) -> Result<EnqueueOutcome, OxanaError> {
         let mut redis = self.connection().await?;
         self.enqueue_w_conn(&mut redis, envelope, JobDestination::Queue)
             .await
     }
 
-    pub async fn enqueue_list(
+    pub async fn try_enqueue_list(
         &self,
         envelopes: Vec<JobEnvelope>,
-    ) -> Result<Vec<JobId>, OxanaError> {
+    ) -> Result<Vec<EnqueueOutcome>, OxanaError> {
         if envelopes.is_empty() {
             return Ok(Vec::new());
         }
@@ -352,28 +451,27 @@ impl StorageInternal {
         redis: &mut deadpool_redis::Connection,
         envelope: JobEnvelope,
         destination: JobDestination,
-    ) -> Result<JobId, OxanaError> {
-        let mut pipe = redis::pipe();
-
-        match self.job_enqueue_action(redis, &envelope).await? {
-            JobEnqueueAction::Skip => {
-                tracing::warn!("Unique job {} already exists, skipping", envelope.id);
-
-                return Ok(envelope.id);
-            }
-            JobEnqueueAction::Replace { existing_queue } => {
-                tracing::warn!("Unique job {} already exists, replacing", envelope.id);
-
-                self.append_replace(&mut pipe, &existing_queue, &envelope, destination)?;
-            }
-            JobEnqueueAction::Default => {
-                self.append_enqueue(&mut pipe, &envelope, destination)?;
+    ) -> Result<EnqueueOutcome, OxanaError> {
+        let serialized = serde_json::to_string(&envelope)?;
+        for _ in 0..ENQUEUE_REPLACE_ATTEMPTS {
+            let existing_queues = self
+                .replace_target_queues(redis, std::slice::from_ref(&envelope))
+                .await?;
+            let invocation = self.enqueue_invocation(
+                &envelope,
+                &serialized,
+                destination,
+                existing_queues.get(&envelope.id).map(String::as_str),
+            );
+            let reply: String = invocation.invoke_async(&mut **redis).await?;
+            if let Some(outcome) = enqueue_reply(&envelope, &reply)? {
+                return Ok(outcome);
             }
         }
-
-        let _: () = pipe.query_async(&mut *redis).await?;
-
-        Ok(envelope.id)
+        Err(OxanaError::GenericError(format!(
+            "Unique job {} kept moving queues while being replaced",
+            envelope.id
+        )))
     }
 
     async fn enqueue_list_w_conn(
@@ -381,183 +479,141 @@ impl StorageInternal {
         redis: &mut deadpool_redis::Connection,
         envelopes: Vec<JobEnvelope>,
         destination: JobDestination,
-    ) -> Result<Vec<JobId>, OxanaError> {
-        let mut job_ids = Vec::with_capacity(envelopes.len());
-        let mut staged_unique_queues: HashMap<JobId, String> = HashMap::new();
+    ) -> Result<Vec<EnqueueOutcome>, OxanaError> {
+        let mut outcomes = Vec::with_capacity(envelopes.len());
 
         for chunk in enqueue_list_chunks(&envelopes) {
+            let existing_queues = self.replace_target_queues(redis, chunk).await?;
             let mut pipe = redis::pipe();
-            let mut has_writes = false;
+            // A pipeline cannot fall back on NOSCRIPT, so it loads the script first.
+            pipe.load_script(&ENQUEUE_SCRIPT).ignore();
 
             for envelope in chunk {
-                let job_id = envelope.id.clone();
-                let action = self
-                    .enqueue_list_action(redis, envelope, &staged_unique_queues)
-                    .await?;
+                let serialized = serde_json::to_string(envelope)?;
+                pipe.invoke_script(&self.enqueue_invocation(
+                    envelope,
+                    &serialized,
+                    destination,
+                    existing_queues.get(&envelope.id).map(String::as_str),
+                ));
+            }
 
-                let wrote = match action {
-                    JobEnqueueAction::Skip => {
-                        tracing::warn!("Unique job {} already exists, skipping", envelope.id);
-                        false
-                    }
-                    JobEnqueueAction::Replace { existing_queue } => {
-                        tracing::warn!("Unique job {} already exists, replacing", envelope.id);
+            let replies: Vec<String> = pipe.query_async(&mut **redis).await?;
 
-                        self.append_replace(&mut pipe, &existing_queue, envelope, destination)?;
-                        true
-                    }
-                    JobEnqueueAction::Default => {
-                        self.append_enqueue(&mut pipe, envelope, destination)?;
-                        true
+            for (envelope, reply) in chunk.iter().zip(replies) {
+                let outcome = match enqueue_reply(envelope, &reply)? {
+                    Some(outcome) => outcome,
+                    // The job moved queues while the pipeline ran, typically
+                    // because an earlier envelope in this batch replaced it.
+                    None => {
+                        self.enqueue_w_conn(redis, envelope.clone(), destination)
+                            .await?
                     }
                 };
-
-                if wrote {
-                    if envelope.meta.unique {
-                        staged_unique_queues.insert(job_id.clone(), envelope.queue.clone());
-                    }
-                    has_writes = true;
-                }
-
-                job_ids.push(job_id);
-            }
-
-            if has_writes {
-                let _: () = pipe.query_async(&mut *redis).await?;
+                outcomes.push(outcome);
             }
         }
 
-        Ok(job_ids)
+        Ok(outcomes)
     }
 
-    async fn enqueue_list_action(
+    /// The queues the existing unique jobs sit on, for the envelopes that
+    /// replace them, keyed by job ID.
+    ///
+    /// The script checks that a job is still on that queue before removing
+    /// it, so a job that moved in between is re-read rather than duplicated.
+    async fn replace_target_queues(
         &self,
         redis: &mut deadpool_redis::Connection,
-        envelope: &JobEnvelope,
-        staged_unique_queues: &HashMap<JobId, String>,
-    ) -> Result<JobEnqueueAction, OxanaError> {
-        if !envelope.meta.unique {
-            return Ok(JobEnqueueAction::Default);
+        envelopes: &[JobEnvelope],
+    ) -> Result<HashMap<JobId, String>, OxanaError> {
+        let replacing: Vec<JobId> = envelopes
+            .iter()
+            .filter(|envelope| {
+                envelope.meta.unique
+                    && envelope.meta.on_conflict == Some(JobConflictStrategy::Replace)
+            })
+            .map(|envelope| envelope.id.clone())
+            .collect();
+        if replacing.is_empty() {
+            return Ok(HashMap::new());
         }
 
-        let Some(existing_queue) = staged_unique_queues.get(&envelope.id) else {
-            return self.job_enqueue_action(redis, envelope).await;
+        Ok(self
+            .get_many_w_conn(redis, &replacing)
+            .await?
+            .into_iter()
+            .map(|existing| (existing.id, existing.queue))
+            .collect())
+    }
+
+    fn enqueue_invocation(
+        &self,
+        envelope: &JobEnvelope,
+        serialized: &str,
+        destination: JobDestination,
+        existing_queue: Option<&str>,
+    ) -> redis::ScriptInvocation<'static> {
+        let queue_key = self.namespace_queue(&envelope.queue);
+        let destination_key = match destination {
+            JobDestination::Queue => &queue_key,
+            JobDestination::Schedule => &self.keys.schedule,
+        };
+        let existing_queue_key = existing_queue.map_or_else(
+            || queue_key.clone(),
+            |existing_queue| self.namespace_queue(existing_queue),
+        );
+        let on_conflict = match envelope.meta.on_conflict {
+            Some(JobConflictStrategy::Replace) => "replace",
+            Some(JobConflictStrategy::Skip) | None => "skip",
         };
 
-        match envelope.meta.on_conflict.as_ref() {
-            Some(JobConflictStrategy::Replace) => Ok(JobEnqueueAction::Replace {
-                existing_queue: existing_queue.clone(),
-            }),
-            Some(JobConflictStrategy::Skip) | None => Ok(JobEnqueueAction::Skip),
-        }
+        let mut invocation = ENQUEUE_SCRIPT.prepare_invoke();
+        invocation
+            .key(&self.keys.jobs)
+            .key(destination_key)
+            .key(&self.keys.schedule)
+            .key(&self.keys.retry)
+            .key(existing_queue_key)
+            .key(&queue_key)
+            .arg(&envelope.id)
+            .arg(serialized)
+            .arg(match destination {
+                JobDestination::Queue => "queue",
+                JobDestination::Schedule => "schedule",
+            })
+            .arg(envelope.meta.scheduled_at)
+            .arg(u8::from(envelope.meta.unique))
+            .arg(on_conflict)
+            .arg(existing_queue.unwrap_or_default());
+        invocation
     }
 
-    fn append_enqueue(
-        &self,
-        pipe: &mut redis::Pipeline,
-        envelope: &JobEnvelope,
-        destination: JobDestination,
-    ) -> Result<(), OxanaError> {
-        pipe.hset(
-            &self.keys.jobs,
-            &envelope.id,
-            serde_json::to_string(envelope)?,
-        );
-        self.push_to_destination(pipe, envelope, destination);
-        Ok(())
-    }
-
-    fn push_to_destination(
-        &self,
-        pipe: &mut redis::Pipeline,
-        envelope: &JobEnvelope,
-        destination: JobDestination,
-    ) {
-        match destination {
-            JobDestination::Queue => {
-                pipe.lpush(self.namespace_queue(&envelope.queue), &envelope.id);
-            }
-            JobDestination::Schedule => {
-                pipe.zadd(
-                    &self.keys.schedule,
-                    &envelope.id,
-                    envelope.meta.scheduled_at,
-                );
-            }
-        }
-    }
-
-    async fn job_enqueue_action(
-        &self,
-        redis: &mut deadpool_redis::Connection,
-        envelope: &JobEnvelope,
-    ) -> Result<JobEnqueueAction, OxanaError> {
-        if !envelope.meta.unique {
-            return Ok(JobEnqueueAction::Default);
-        }
-
-        let exists: bool = redis.hexists(&self.keys.jobs, &envelope.id).await?;
-
-        if exists {
-            match envelope.meta.on_conflict {
-                Some(JobConflictStrategy::Skip) | None => Ok(JobEnqueueAction::Skip),
-                Some(JobConflictStrategy::Replace) => {
-                    match self.get_job_w_conn(redis, &envelope.id).await? {
-                        Some(existing) => Ok(JobEnqueueAction::Replace {
-                            existing_queue: existing.queue,
-                        }),
-                        None => Ok(JobEnqueueAction::Default),
-                    }
-                }
-            }
-        } else {
-            Ok(JobEnqueueAction::Default)
-        }
-    }
-
-    fn append_replace(
-        &self,
-        pipe: &mut redis::Pipeline,
-        existing_queue: &str,
-        envelope: &JobEnvelope,
-        destination: JobDestination,
-    ) -> Result<(), OxanaError> {
-        let old_queue = self.namespace_queue(existing_queue);
-
-        pipe.hset(
-            &self.keys.jobs,
-            &envelope.id,
-            serde_json::to_string(envelope)?,
-        )
-        .zrem(&self.keys.schedule, &envelope.id)
-        .zrem(&self.keys.retry, &envelope.id)
-        .lrem(old_queue, 0, &envelope.id);
-
-        if existing_queue != envelope.queue.as_str() {
-            pipe.lrem(self.namespace_queue(&envelope.queue), 0, &envelope.id);
-        }
-
-        self.push_to_destination(pipe, envelope, destination);
-
-        Ok(())
-    }
-
-    pub async fn enqueue_in(
+    pub async fn try_enqueue_in(
         &self,
         envelope: JobEnvelope,
         delay_s: u64,
-    ) -> Result<JobId, OxanaError> {
+    ) -> Result<EnqueueOutcome, OxanaError> {
         if delay_s == 0 {
-            self.enqueue(envelope).await
+            self.try_enqueue(envelope).await
         } else {
             let time = chrono::Utc::now() + chrono::Duration::seconds(delay_s as i64);
-            self.enqueue_at(envelope.with_scheduled_at(time)).await
+            self.try_enqueue_at(envelope.with_scheduled_at(time)).await
         }
     }
 
     pub async fn enqueue_at(&self, envelope: JobEnvelope) -> Result<JobId, OxanaError> {
+        self.try_enqueue_at(envelope)
+            .await
+            .map(EnqueueOutcome::into_job_id)
+    }
+
+    pub async fn try_enqueue_at(
+        &self,
+        envelope: JobEnvelope,
+    ) -> Result<EnqueueOutcome, OxanaError> {
         if envelope.meta.scheduled_at <= chrono::Utc::now().timestamp_micros() {
-            return self.enqueue(envelope).await;
+            return self.try_enqueue(envelope).await;
         }
 
         let mut redis = self.connection().await?;
@@ -739,10 +795,18 @@ impl StorageInternal {
 
     pub async fn get_many(&self, ids: &[JobId]) -> Result<Vec<JobEnvelope>, OxanaError> {
         let mut redis = self.connection().await?;
+        self.get_many_w_conn(&mut redis, ids).await
+    }
+
+    async fn get_many_w_conn(
+        &self,
+        redis: &mut deadpool_redis::Connection,
+        ids: &[JobId],
+    ) -> Result<Vec<JobEnvelope>, OxanaError> {
         let mut cmd = redis::cmd("HMGET");
         cmd.arg(&self.keys.jobs);
         cmd.arg(ids);
-        let envelopes_str: Vec<Option<String>> = cmd.query_async(&mut redis).await?;
+        let envelopes_str: Vec<Option<String>> = cmd.query_async(&mut **redis).await?;
         let mut envelopes: Vec<JobEnvelope> = vec![];
         for envelope_str in envelopes_str.into_iter().flatten() {
             envelopes.push(serde_json::from_str(&envelope_str)?);
@@ -825,42 +889,43 @@ impl StorageInternal {
             return Ok(0);
         }
 
-        let mut claim_pipe = redis::pipe();
-        for job_id in &job_ids {
-            claim_pipe.zrem(schedule_queue, job_id);
-        }
-        let claimed: Vec<u32> = claim_pipe.query_async(&mut *redis).await?;
-
-        let claimed_job_ids: Vec<JobId> = job_ids
-            .into_iter()
-            .zip(claimed)
-            .filter(|(_, removed)| *removed > 0)
-            .map(|(id, _)| id)
-            .collect();
-
-        if claimed_job_ids.is_empty() {
-            return Ok(0);
-        }
-
-        let envelopes = self.get_many(&claimed_job_ids).await?;
-        let envelopes_count = envelopes.len();
-
-        let mut enqueue_pipe = redis::pipe();
-        let mut map: HashMap<&str, Vec<&str>> = HashMap::new();
+        // Read the queues first, claim second: the claim and the push happen
+        // in one script per queue, so a job is never on no list in between.
+        let envelopes = self.get_many_w_conn(redis, &job_ids).await?;
+        let mut by_queue: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut filed: HashSet<&str> = HashSet::with_capacity(envelopes.len());
 
         for envelope in envelopes.iter() {
-            map.entry(&envelope.queue)
+            by_queue
+                .entry(&envelope.queue)
                 .or_default()
                 .push(envelope.id.as_str());
+            filed.insert(envelope.id.as_str());
         }
 
-        for (queue, job_ids) in map {
-            enqueue_pipe.lpush(self.namespace_queue(queue), job_ids);
+        let mut pipe = redis::pipe();
+        pipe.load_script(&PROMOTE_SCRIPT).ignore();
+        for (queue, job_ids) in by_queue {
+            let mut invocation = PROMOTE_SCRIPT.prepare_invoke();
+            invocation
+                .key(schedule_queue)
+                .key(self.namespace_queue(queue))
+                .arg(job_ids);
+            pipe.invoke_script(&invocation);
         }
 
-        let _: () = enqueue_pipe.query_async(&mut *redis).await?;
+        // A scheduled id without a job record has nothing to promote.
+        let orphans: Vec<&str> = job_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|job_id| !filed.contains(job_id))
+            .collect();
+        if !orphans.is_empty() {
+            pipe.zrem(schedule_queue, orphans).ignore();
+        }
 
-        Ok(envelopes_count)
+        let promoted: Vec<usize> = pipe.query_async(&mut **redis).await?;
+        Ok(promoted.into_iter().sum())
     }
 
     pub async fn retry_all_now(&self) -> Result<usize, OxanaError> {
@@ -2028,11 +2093,13 @@ impl StorageInternal {
         self.processing_queue(&self.current_process().id())
     }
 
-    #[cfg(test)]
-    async fn currently_processing_job_ids(&self) -> Result<Vec<String>, OxanaError> {
+    /// The jobs this process currently holds in its processing list.
+    pub(crate) async fn processing_job_ids(&self) -> Result<Vec<JobId>, OxanaError> {
         let mut redis = self.connection().await?;
-        let job_id: Option<String> = (*redis).lindex(self.current_processing_queue(), 0).await?;
-        Ok(job_id.into_iter().collect())
+        let job_ids: Vec<JobId> = (*redis)
+            .lrange(self.current_processing_queue(), 0, -1)
+            .await?;
+        Ok(job_ids)
     }
 
     fn current_process(&self) -> Process {
@@ -2383,6 +2450,69 @@ mod tests {
         Ok(())
     }
 
+    /// Polls `future` at most `budget` times, dropping it if it is still
+    /// pending: a process dying at that point in the operation.
+    async fn poll_at_most<F: Future>(future: F, budget: usize) -> Option<F::Output> {
+        let mut future = Box::pin(future);
+        let mut remaining = budget;
+        std::future::poll_fn(|cx| match future.as_mut().poll(cx) {
+            std::task::Poll::Ready(output) => std::task::Poll::Ready(Some(output)),
+            std::task::Poll::Pending => {
+                remaining -= 1;
+                if remaining == 0 {
+                    std::task::Poll::Ready(None)
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn promoting_a_due_job_never_leaves_it_on_no_list() -> TestResult {
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
+        let queue = random_string();
+        let queue_key = storage.namespace_queue(&queue);
+        let mut redis = storage.connection().await?;
+        let mut completed = false;
+
+        for budget in 1..=64 {
+            let due = chrono::Utc::now() - chrono::Duration::seconds(1);
+            let envelope = JobEnvelope::new(queue.clone(), TestJob {})?.with_scheduled_at(due);
+            storage
+                .enqueue_w_conn(&mut redis, envelope.clone(), JobDestination::Schedule)
+                .await?;
+
+            let promoted =
+                poll_at_most(storage.enqueue_scheduled(&storage.keys.schedule), budget).await;
+
+            let scheduled: Option<f64> = redis.zscore(&storage.keys.schedule, &envelope.id).await?;
+            let queued: Vec<String> = redis.lrange(&queue_key, 0, -1).await?;
+            let filed: bool = redis.hexists(&storage.keys.jobs, &envelope.id).await?;
+            assert!(filed, "budget {budget}: job record lost");
+            assert_eq!(
+                usize::from(scheduled.is_some()) + queued.len(),
+                1,
+                "budget {budget}: scheduled={scheduled:?} queued={queued:?}"
+            );
+
+            storage.delete_job(&envelope.id).await?;
+            if let Some(count) = promoted {
+                assert_eq!(count?, 1);
+                assert!(scheduled.is_none());
+                completed = true;
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "promotion never completed within the poll budget"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn unique_cron_skips_an_observed_occurrence_if_it_vanishes_after_due() {
         assert_eq!(
@@ -2467,7 +2597,7 @@ mod tests {
 
     #[tokio::test]
     async fn redis_failure_tolerance_controls_escalation() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
 
         assert!(
             storage
@@ -2491,7 +2621,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ping() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         storage.ping().await?;
 
         let processes = storage.processes(DEAD_PROCESS_THRESHOLD).await?;
@@ -2510,7 +2640,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_latency() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
 
         let mut envelope = JobEnvelope::new(queue.clone(), TestJob {})?;
@@ -2528,7 +2658,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_latency_multiple_jobs() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
 
         let latency_ms = storage.latency_ms(&queue).await?;
@@ -2565,7 +2695,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
         let mut expired_envelope1 = JobEnvelope::new(queue.clone(), TestJob {})?;
         expired_envelope1.meta.created_at =
@@ -2597,7 +2727,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_preserves_future_scheduled_job_until_due() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
         let now = chrono::Utc::now();
         let created_at = now - chrono::Duration::days(8);
@@ -2636,7 +2766,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_uses_later_creation_or_scheduled_time() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
         let now = chrono::Utc::now();
 
@@ -2662,7 +2792,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_empty() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
 
         assert_eq!(storage.cleanup().await?, 0);
 
@@ -2671,38 +2801,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_resurrect() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
         let envelope = JobEnvelope::new(queue.clone(), TestJob {})?;
 
         storage.enqueue(envelope.clone()).await?;
 
         assert_eq!(storage.enqueued_count(&queue).await?, 1);
-        assert!(storage.currently_processing_job_ids().await?.is_empty());
+        assert!(storage.processing_job_ids().await?.is_empty());
 
         let job_id = storage.dequeue(&queue).await?;
 
         assert_eq!(job_id, Some(envelope.id));
 
         assert_eq!(storage.enqueued_count(&queue).await?, 0);
-        assert_eq!(
-            storage.currently_processing_job_ids().await?,
-            vec![job_id.unwrap()]
-        );
+        assert_eq!(storage.processing_job_ids().await?, vec![job_id.unwrap()]);
 
         expire_heartbeat(&storage).await?;
 
         storage.resurrect(DEAD_PROCESS_THRESHOLD).await?;
 
         assert_eq!(storage.enqueued_count(&queue).await?, 1);
-        assert!(storage.currently_processing_job_ids().await?.is_empty());
+        assert!(storage.processing_job_ids().await?.is_empty());
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_resurrect_unique_job() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
         let envelope = JobEnvelope::new_cron(
             queue.clone(),
@@ -2719,7 +2846,7 @@ mod tests {
         storage.enqueue(envelope.clone()).await?;
 
         assert_eq!(storage.enqueued_count(&queue).await?, 1);
-        assert!(storage.currently_processing_job_ids().await?.is_empty());
+        assert!(storage.processing_job_ids().await?.is_empty());
         assert!(storage.get_job(&envelope.id).await?.is_some());
 
         let job_id = storage.dequeue(&queue).await?;
@@ -2728,7 +2855,7 @@ mod tests {
 
         assert_eq!(storage.enqueued_count(&queue).await?, 0);
         assert_eq!(
-            storage.currently_processing_job_ids().await?,
+            storage.processing_job_ids().await?,
             vec![job_id.expect("job_id should be Some")]
         );
 
@@ -2737,7 +2864,7 @@ mod tests {
         storage.resurrect(DEAD_PROCESS_THRESHOLD).await?;
 
         assert_eq!(storage.enqueued_count(&queue).await?, 1);
-        assert!(storage.currently_processing_job_ids().await?.is_empty());
+        assert!(storage.processing_job_ids().await?.is_empty());
         assert!(
             storage.get_job(&envelope.id).await?.is_some(),
             "unique job should still exist in jobs hash after resurrection"
@@ -2748,29 +2875,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_resurrect_when_process_is_missing() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
         let envelope = JobEnvelope::new(queue.clone(), TestJob {})?;
 
         storage.enqueue(envelope.clone()).await?;
 
         assert_eq!(storage.enqueued_count(&queue).await?, 1);
-        assert!(storage.currently_processing_job_ids().await?.is_empty());
+        assert!(storage.processing_job_ids().await?.is_empty());
 
         let job_id = storage.dequeue(&queue).await?;
 
         assert_eq!(job_id, Some(envelope.id));
 
         assert_eq!(storage.enqueued_count(&queue).await?, 0);
-        assert_eq!(
-            storage.currently_processing_job_ids().await?,
-            vec![job_id.unwrap()]
-        );
+        assert_eq!(storage.processing_job_ids().await?, vec![job_id.unwrap()]);
 
         storage.resurrect(Duration::from_secs(5)).await?;
 
         assert_eq!(storage.enqueued_count(&queue).await?, 1);
-        assert!(storage.currently_processing_job_ids().await?.is_empty());
+        assert!(storage.processing_job_ids().await?.is_empty());
 
         Ok(())
     }
@@ -2782,7 +2906,7 @@ mod tests {
     async fn test_resurrect_after_restart_with_same_hostname_and_pid() -> TestResult {
         let pool = redis_pool().await?;
         let namespace = random_string();
-        let crashed = StorageInternal::new(pool.clone(), Some(namespace.clone()));
+        let crashed = StorageInternal::with_namespace(pool.clone(), namespace.clone());
         let queue = random_string();
         let envelope = JobEnvelope::new(queue.clone(), TestJob {})?;
 
@@ -2790,12 +2914,12 @@ mod tests {
         assert_eq!(crashed.dequeue(&queue).await?, Some(envelope.id));
         expire_heartbeat(&crashed).await?;
 
-        let restarted = StorageInternal::new(pool, Some(namespace));
+        let restarted = StorageInternal::with_namespace(pool, namespace);
         restarted.ping().await?;
         restarted.resurrect(DEAD_PROCESS_THRESHOLD).await?;
 
         assert_eq!(restarted.enqueued_count(&queue).await?, 1);
-        assert!(crashed.currently_processing_job_ids().await?.is_empty());
+        assert!(crashed.processing_job_ids().await?.is_empty());
 
         Ok(())
     }
@@ -2807,13 +2931,13 @@ mod tests {
     async fn test_a_process_registered_after_the_scan_is_not_dead() -> TestResult {
         let pool = redis_pool().await?;
         let namespace = random_string();
-        let peer = StorageInternal::new(pool.clone(), Some(namespace.clone()));
+        let peer = StorageInternal::with_namespace(pool.clone(), namespace.clone());
         let queue = random_string();
         let envelope = JobEnvelope::new(queue.clone(), TestJob {})?;
         peer.enqueue(envelope.clone()).await?;
 
         // Claims first and registers second, as it would halfway through a scan.
-        let started = StorageInternal::new(pool, Some(namespace));
+        let started = StorageInternal::with_namespace(pool, namespace);
         assert_eq!(started.dequeue(&queue).await?, Some(envelope.id));
 
         let scanned = HashSet::from([started.current_processing_queue()]);
@@ -2834,7 +2958,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_queue_discovery_only_returns_queue_keys() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue_a = storage.namespace_queue("prefix-a");
         let queue_b = storage.namespace_queue("prefix#fast");
         let queue_c = storage.namespace_queue("other");
@@ -2869,7 +2993,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_queue_config_defaults_and_updates() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
 
         let default_config = QueueRuntimeConfig::new(3);
@@ -2921,7 +3045,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_queue_state_update_without_config_does_not_store_concurrency() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
 
         storage.set_queue_state(&queue, QueueState::Paused).await?;
@@ -2951,7 +3075,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_flush_result_stats_batches_counts() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let static_queue = random_string();
         let dynamic_prefix = random_string();
         let dynamic_queue = format!("{dynamic_prefix}#fast");
@@ -3014,7 +3138,7 @@ mod tests {
     async fn test_stats_batch_processing_with_one_connection() -> TestResult {
         let pool = redis_pool().await?;
         pool.resize(1);
-        let storage = StorageInternal::new(pool, Some(random_string()));
+        let storage = StorageInternal::with_namespace(pool, random_string());
         let mut redis = storage.connection().await?;
         let mut pipe = redis::pipe();
         let mut expected = Vec::new();
@@ -3072,7 +3196,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_batch_queue_heads_and_snapshot_lengths() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let mut redis = storage.connection().await?;
         let mut pipe = redis::pipe();
         let mut keys = Vec::new();
@@ -3128,7 +3252,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dashboard_stats_skip_history_and_preserve_counts() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let threshold = Duration::from_secs(60);
         let empty = storage.dashboard_stats(threshold).await?;
         assert!(empty.queues.is_empty());
@@ -3175,7 +3299,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_include_queue_rates_from_historical_counters() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let static_queue = random_string();
         let dynamic_prefix = random_string();
         let dynamic_queue_a = format!("{dynamic_prefix}#a");
@@ -3298,7 +3422,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_refresh_queue_length_stats_reports_llen() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let static_queue = random_string();
         let dynamic_prefix = random_string();
         let dynamic_queue = format!("{dynamic_prefix}#fast");
@@ -3392,7 +3516,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_use_fresh_queue_length_snapshots() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let static_queue = random_string();
         let dynamic_prefix = random_string();
         let dynamic_queue_a = format!("{dynamic_prefix}#a");
@@ -3465,7 +3589,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_ignore_zero_queue_length_snapshots_without_other_stats() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let static_queue = random_string();
         let dynamic_prefix = random_string();
         let dynamic_queue = format!("{dynamic_prefix}#empty");
@@ -3509,7 +3633,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_use_live_llen_when_queue_length_snapshot_is_stale() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
 
         storage
@@ -3545,7 +3669,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_many_with_missing_jobs() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
 
         let envelope1 = JobEnvelope::new(queue.clone(), TestJob {})?;
@@ -3577,7 +3701,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_job_cleans_up_corrupt_job_memberships() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
         let envelope = JobEnvelope::new(queue.clone(), TestJob {})?;
         let job_id = envelope.id.clone();
@@ -3600,14 +3724,14 @@ mod tests {
         assert_eq!(storage.enqueued_count(&queue).await?, 0);
         assert_eq!(storage.scheduled_count().await?, 0);
         assert_eq!(storage.retries_count().await?, 0);
-        assert!(storage.currently_processing_job_ids().await?.is_empty());
+        assert!(storage.processing_job_ids().await?.is_empty());
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_list_queue_jobs() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
 
         let envelope1 = JobEnvelope::new(queue.clone(), TestJob {})?;
@@ -3651,7 +3775,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wipe_queue() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
 
         let envelope1 = JobEnvelope::new(queue.clone(), TestJob {})?;
@@ -3675,7 +3799,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wipe_dead() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
         let envelope1 = JobEnvelope::new(queue.clone(), TestJob {})?;
         let envelope2 = JobEnvelope::new(queue, TestJob {})?;
@@ -3705,7 +3829,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_revive_all_dead() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
         let envelope1 = JobEnvelope::new(queue.clone(), TestJob {})?;
         let envelope2 = JobEnvelope::new(queue.clone(), TestJob {})?;
@@ -3731,7 +3855,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_restore_claimed_dead_entries_skips_already_revived_entries() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
         let revived = JobEnvelope::new(queue, TestJob {})?;
         let remaining = JobEnvelope::new(random_string(), TestJob {})?;
@@ -3763,7 +3887,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_all_now_enqueues_all_pending_retries() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
         let envelope1 = JobEnvelope::new(queue.clone(), TestJob {})?;
         let envelope2 = JobEnvelope::new(queue.clone(), TestJob {})?;
@@ -3795,7 +3919,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_started_at_batch() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
 
         let mut envelopes = vec![
@@ -3834,7 +3958,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_finish_with_success_batch() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
 
         let envelopes = vec![
@@ -3849,12 +3973,7 @@ mod tests {
             assert_eq!(storage.dequeue(&queue).await?, Some(envelope.id.clone()));
         }
 
-        let mut redis = storage.connection().await?;
-        let processing_before: Vec<JobId> = (*redis)
-            .lrange(storage.current_processing_queue(), 0, -1)
-            .await?;
-        assert_eq!(processing_before.len(), 2);
-        drop(redis);
+        assert_eq!(storage.processing_job_ids().await?.len(), 2);
 
         storage.finish_with_success_batch(&envelopes).await?;
 
@@ -3864,18 +3983,14 @@ mod tests {
         assert_eq!(storage.enqueued_count(&queue).await?, 0);
         assert_eq!(storage.jobs_count().await?, 0);
 
-        let mut redis = storage.connection().await?;
-        let processing_after: Vec<JobId> = (*redis)
-            .lrange(storage.current_processing_queue(), 0, -1)
-            .await?;
-        assert!(processing_after.is_empty());
+        assert!(storage.processing_job_ids().await?.is_empty());
 
         Ok(())
     }
 
     #[tokio::test]
     async fn test_enqueue_envelope() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
 
         let now = chrono::Utc::now().timestamp_micros();
@@ -3918,7 +4033,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_enqueue_in_envelope() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
 
         let now = chrono::Utc::now().timestamp_micros();
@@ -3950,7 +4065,10 @@ mod tests {
             .unwrap();
 
         let before = chrono::Utc::now().timestamp_micros();
-        let returned_id = storage.enqueue_in(envelope, delay_s as u64).await?;
+        let returned_id = storage
+            .try_enqueue_in(envelope, delay_s as u64)
+            .await?
+            .into_job_id();
         let after = chrono::Utc::now().timestamp_micros();
         assert_eq!(returned_id, id);
         assert_eq!(storage.enqueued_count(&queue).await?, 0);
@@ -3980,7 +4098,7 @@ mod tests {
             }
         }
 
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
         let envelope = JobEnvelope::new(queue, UniqueTestJob)?;
         let first_at = chrono::Utc::now() + chrono::Duration::seconds(60);
@@ -4005,7 +4123,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_enqueue_at_unique_replace_envelope() -> TestResult {
-        let storage = StorageInternal::new(redis_pool().await?, Some(random_string()));
+        let storage = StorageInternal::with_namespace(redis_pool().await?, random_string());
         let queue = random_string();
 
         let now = chrono::Utc::now().timestamp_micros();

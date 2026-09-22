@@ -813,3 +813,210 @@ pub async fn test_delete_unique_job_rejects_non_unique_job() -> TestResult {
 
     Ok(())
 }
+
+#[tokio::test]
+pub async fn test_try_enqueue_reports_duplicate_and_replacement() -> TestResult {
+    let redis_pool = setup();
+    let storage = oxana::Storage::builder()
+        .namespace(random_string())
+        .build_from_pool(redis_pool)?;
+    let key = random_string();
+    let skip_job = || WorkerUniqueSkipJob {
+        id: 1,
+        key: key.clone(),
+        value: 1,
+    };
+    let replace_job = || WorkerUniqueReplaceJob {
+        id: 2,
+        key: key.clone(),
+        value: 1,
+    };
+
+    let first = storage.try_enqueue(QueueOne, skip_job()).await?;
+    let oxana::EnqueueOutcome::Enqueued(first_id) = &first else {
+        panic!("first push must be filed, got {first:?}");
+    };
+    assert_eq!(first.job_id(), first_id);
+    assert!(first.is_enqueued());
+
+    let second = storage.try_enqueue(QueueOne, skip_job()).await?;
+    assert_eq!(
+        second,
+        oxana::EnqueueOutcome::Duplicate {
+            existing: first_id.clone()
+        }
+    );
+    assert!(!second.is_enqueued());
+    assert_eq!(second.job_id(), first_id);
+    // The plain API keeps returning the id either way.
+    assert_eq!(&storage.enqueue(QueueOne, skip_job()).await?, first_id);
+    assert_eq!(storage.enqueued_count(QueueOne).await?, 1);
+
+    let first = storage.try_enqueue(QueueOne, replace_job()).await?;
+    let oxana::EnqueueOutcome::Enqueued(replace_id) = first else {
+        panic!("first push must be filed, got {first:?}");
+    };
+    let second = storage.try_enqueue(QueueOne, replace_job()).await?;
+    assert_eq!(second, oxana::EnqueueOutcome::Replaced(replace_id));
+    assert!(second.is_enqueued());
+    assert_eq!(storage.enqueued_count(QueueOne).await?, 2);
+
+    let scheduled = storage
+        .try_enqueue_in(
+            QueueOne,
+            WorkerUniqueSkipJob {
+                id: 3,
+                key: key.clone(),
+                value: 1,
+            },
+            60,
+        )
+        .await?;
+    assert!(matches!(scheduled, oxana::EnqueueOutcome::Enqueued(_)));
+    assert_eq!(storage.scheduled_count().await?, 1);
+
+    let outcomes = storage
+        .try_enqueue_list(
+            QueueOne,
+            [
+                skip_job(),
+                WorkerUniqueSkipJob {
+                    id: 4,
+                    key: String::new(),
+                    value: 1,
+                },
+            ],
+        )
+        .await?;
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [
+                oxana::EnqueueOutcome::Duplicate { .. },
+                oxana::EnqueueOutcome::Enqueued(_)
+            ]
+        ),
+        "{outcomes:?}"
+    );
+    let outcomes = storage.try_enqueue_list(QueueOne, [replace_job()]).await?;
+    assert!(
+        matches!(outcomes.as_slice(), [oxana::EnqueueOutcome::Replaced(_)]),
+        "{outcomes:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+pub async fn test_concurrent_unique_pushes_enqueue_exactly_one() -> TestResult {
+    let redis_pool = setup();
+    let storage = oxana::Storage::builder()
+        .namespace(random_string())
+        .build_from_pool(redis_pool.clone())?;
+    let namespace = storage.namespace().to_string();
+    let mut redis = redis_pool.get().await?;
+
+    for round in 0..20 {
+        let key = random_string();
+        let mut pushes = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let storage = storage.clone();
+            let key = key.clone();
+            pushes.spawn(async move {
+                storage
+                    .try_enqueue(
+                        QueueOne,
+                        WorkerUniqueSkipJob {
+                            id: round,
+                            key,
+                            value: 1,
+                        },
+                    )
+                    .await
+            });
+        }
+        let mut enqueued = 0;
+        let mut duplicates = 0;
+        while let Some(outcome) = pushes.join_next().await {
+            match outcome?? {
+                oxana::EnqueueOutcome::Enqueued(_) => enqueued += 1,
+                oxana::EnqueueOutcome::Duplicate { .. } => duplicates += 1,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        }
+        assert_eq!((enqueued, duplicates), (1, 15), "round {round}");
+
+        let queued: Vec<String> = redis
+            .lrange(format!("{namespace}:queue:one"), 0, -1)
+            .await?;
+        assert_eq!(
+            queued.len(),
+            round as usize + 1,
+            "round {round}: {queued:?}"
+        );
+        assert_eq!(storage.jobs_count().await?, round as usize + 1);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+pub async fn test_cancel_and_push_on_one_unique_key_never_drops_the_push_silently() -> TestResult {
+    let redis_pool = setup();
+    let storage = oxana::Storage::builder()
+        .namespace(random_string())
+        .build_from_pool(redis_pool.clone())?;
+    let namespace = storage.namespace().to_string();
+    let mut redis = redis_pool.get().await?;
+    let job = || WorkerUniqueSkipJob {
+        id: 1,
+        key: "key".to_string(),
+        value: 1,
+    };
+    let job_id = storage.enqueue(QueueOne, job()).await?;
+    let queue_key = format!("{namespace}:queue:one");
+
+    let mut reported_duplicates = 0;
+    for round in 0..50 {
+        let cancel = {
+            let storage = storage.clone();
+            let job_id = job_id.clone();
+            tokio::spawn(async move { storage.delete_unique_job(&job_id).await })
+        };
+        let push = {
+            let storage = storage.clone();
+            tokio::spawn(async move { storage.try_enqueue(QueueOne, job()).await })
+        };
+        cancel.await??;
+        let outcome = push.await??;
+
+        let filed: bool = redis.hexists(format!("{namespace}:jobs"), &job_id).await?;
+        let queued: Vec<String> = redis.lrange(&queue_key, 0, -1).await?;
+        match outcome {
+            // The push landed after the cancel: the job must be filed, once.
+            oxana::EnqueueOutcome::Enqueued(_) => {
+                assert!(filed, "round {round}: reported enqueued but not filed");
+                assert_eq!(queued, vec![job_id.clone()], "round {round}");
+            }
+            // The push saw the job before the cancel removed it: the caller is
+            // told, rather than handed an id of a job that no longer exists.
+            oxana::EnqueueOutcome::Duplicate { existing } => {
+                assert_eq!(existing, job_id);
+                assert!(
+                    !filed,
+                    "round {round}: duplicate reported but job still filed"
+                );
+                assert!(queued.is_empty(), "round {round}: {queued:?}");
+                reported_duplicates += 1;
+                storage.enqueue(QueueOne, job()).await?;
+            }
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+    tracing::info!(
+        reported_duplicates,
+        "cancel+push rounds that reported a duplicate"
+    );
+
+    Ok(())
+}

@@ -1,8 +1,10 @@
 mod batch;
+mod classify;
 mod cron;
 mod dead;
 mod drain;
 mod dynamic;
+mod keys;
 mod metrics;
 mod panic;
 #[cfg(feature = "macros")]

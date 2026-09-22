@@ -1,13 +1,14 @@
 use deadpool_redis::Hook;
 use std::time::Duration;
 
-use crate::{OxanaError, Storage, storage_internal::StorageInternal};
+use crate::{OxanaError, Storage, storage_internal::StorageInternal, storage_keys::StorageKeys};
 
 const DEFAULT_REDIS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[must_use]
 pub struct StorageBuilder {
     namespace: Option<String>,
+    keys: Option<StorageKeys>,
     max_pool_size: Option<usize>,
     timeouts: Option<StorageBuilderTimeouts>,
     redis_response_timeout: Option<Duration>,
@@ -60,15 +61,33 @@ impl StorageBuilder {
     pub fn new() -> Self {
         Self {
             namespace: None,
+            keys: None,
             max_pool_size: None,
             timeouts: None,
             redis_response_timeout: None,
         }
     }
 
+    /// Sets the namespace every Redis key is built under, in the default
+    /// layout. See [`keys`](Self::keys) to change the layout itself.
     pub fn namespace(mut self, namespace: impl Into<String>) -> Self {
         self.namespace = Some(namespace.into());
         self
+    }
+
+    /// Sets the Redis key layout, taking precedence over
+    /// [`namespace`](Self::namespace). [`StorageKeys::new`] reproduces the
+    /// default layout for a namespace, and its `with_*` methods override one
+    /// key or prefix each.
+    pub fn keys(mut self, keys: StorageKeys) -> Self {
+        self.keys = Some(keys);
+        self
+    }
+
+    fn storage_keys(&self) -> StorageKeys {
+        self.keys
+            .clone()
+            .unwrap_or_else(|| StorageKeys::new(self.namespace.clone().unwrap_or_default()))
     }
 
     pub fn max_pool_size(mut self, max_pool_size: usize) -> Self {
@@ -95,7 +114,10 @@ impl StorageBuilder {
                 .unwrap_or(DEFAULT_REDIS_RESPONSE_TIMEOUT),
         )?;
 
-        Ok(Storage::new(StorageInternal::new(pool, self.namespace)))
+        Ok(Storage::new(StorageInternal::new(
+            pool,
+            self.storage_keys(),
+        )))
     }
 
     pub fn build_from_redis_urls(
@@ -115,7 +137,7 @@ impl StorageBuilder {
         Ok(Storage::new(StorageInternal::with_stats_pool(
             pool,
             stats_pool,
-            self.namespace,
+            self.storage_keys(),
         )))
     }
 
@@ -172,7 +194,7 @@ impl StorageBuilder {
     /// `redis_response_timeout` settings do not apply here — the provided pool
     /// is used as-is.
     pub fn build_from_pool(self, pool: deadpool_redis::Pool) -> Result<Storage, OxanaError> {
-        let internal = StorageInternal::new(pool, self.namespace);
+        let internal = StorageInternal::new(pool, self.storage_keys());
         Ok(Storage::new(internal))
     }
 
@@ -186,7 +208,7 @@ impl StorageBuilder {
         pool: deadpool_redis::Pool,
         stats_pool: deadpool_redis::Pool,
     ) -> Result<Storage, OxanaError> {
-        let internal = StorageInternal::with_stats_pool(pool, stats_pool, self.namespace);
+        let internal = StorageInternal::with_stats_pool(pool, stats_pool, self.storage_keys());
         Ok(Storage::new(internal))
     }
 }

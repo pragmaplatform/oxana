@@ -13,6 +13,7 @@ struct OxanaArgs {
     registry: Option<Path>,
     max_retries: Option<MaxRetries>,
     retry_delay: Option<RetryDelay>,
+    classify: Option<Path>,
     batch_size: Option<usize>,
     batch_timeout_ms: Option<u64>,
     cron: Option<Cron>,
@@ -138,6 +139,15 @@ fn expand_worker_impl(
         None => quote!(),
     };
 
+    let classify = match &args.classify {
+        Some(func) => quote! {
+            fn classify(&self, job: &#type_args, error: &Self::Error) -> oxana::FailureKind {
+                #func(self, job, error)
+            }
+        },
+        None => quote!(),
+    };
+
     let cron = match &args.cron {
         Some(cron) => expand_cron(cron),
         None => quote!(),
@@ -179,6 +189,8 @@ fn expand_worker_impl(
             #max_retries
 
             #retry_delay
+
+            #classify
 
             #cron
 

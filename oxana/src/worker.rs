@@ -23,6 +23,21 @@ impl WorkerBatchConfig {
     }
 }
 
+/// How the runtime treats a failed attempt, decided by
+/// [`Worker::classify`] once the error is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum FailureKind {
+    /// Retry while the worker's [`max_retries`](Worker::max_retries) budget
+    /// lasts, then dead-letter. The default.
+    #[default]
+    Retry,
+    /// Dead-letter at once, whatever the retry count: the attempt showed the
+    /// job can never succeed, so re-running the handler would only repeat its
+    /// side effects.
+    DeadLetter,
+}
+
 pub trait Job: Send + serde::Serialize {
     #[doc(hidden)]
     const REPLACES_ON_CONFLICT: bool = false;
@@ -99,6 +114,21 @@ pub trait Worker<Args: Send + 'static>: Send + Sync {
         2
     }
 
+    /// Classifies a failed attempt once its error is known.
+    ///
+    /// [`max_retries`](Self::max_retries) settles the retry budget before the
+    /// handler runs; this runs after it fails, with the job and the error, so a
+    /// worker that learns during the attempt that the payload can never succeed
+    /// can return [`FailureKind::DeadLetter`] and have the job dead-lettered
+    /// at once instead of re-run until the budget is spent. For a batch it is
+    /// called once per job with the batch's error.
+    ///
+    /// The default returns [`FailureKind::Retry`], which keeps the retry
+    /// budget as the only policy. Panics are never classified.
+    fn classify(&self, _job: &Args, _error: &Self::Error) -> FailureKind {
+        FailureKind::Retry
+    }
+
     fn retry_delay(&self, _job: &Args, retries: u32) -> u64 {
         // 0 -> 25 seconds
         // 1 -> 125 seconds
@@ -158,9 +188,23 @@ pub trait FromContext<T> {
     fn from_context(ctx: &T) -> Self;
 }
 
+/// A failed execution: the error, and how the worker classified it for each
+/// job of the batch, in job order.
+#[doc(hidden)]
+pub struct ProcessFailure {
+    pub(crate) error: WorkerError,
+    pub(crate) kinds: Vec<FailureKind>,
+}
+
 #[async_trait::async_trait]
 pub trait Processable: Send {
-    async fn process(self: Box<Self>, contexts: Vec<JobContext>) -> Result<(), WorkerError>;
+    /// Runs the worker. `args` are the jobs' stored arguments, in job order,
+    /// from which a failed attempt rebuilds the jobs for [`Worker::classify`].
+    async fn process(
+        self: Box<Self>,
+        contexts: Vec<JobContext>,
+        args: &[&serde_json::Value],
+    ) -> Result<(), ProcessFailure>;
     fn len(&self) -> usize;
     fn job_name(&self) -> &'static str;
     fn worker_name(&self) -> &'static str;
@@ -227,22 +271,52 @@ pub(crate) struct BoundBatchJob<W, A> {
     pub jobs: Vec<A>,
 }
 
+/// Classifies a failure for each job, rebuilt from its stored arguments.
+///
+/// Arguments that deserialized once deserialize again; should they not, the
+/// job falls back to the retry budget rather than being dead-lettered.
+fn classify_failure<W, A>(
+    worker: &W,
+    args: &[&serde_json::Value],
+    error: W::Error,
+) -> ProcessFailure
+where
+    W: Worker<A>,
+    A: Job + serde::de::DeserializeOwned + Send + 'static,
+{
+    let kinds = args
+        .iter()
+        .map(|args| {
+            A::deserialize(*args).map_or(FailureKind::Retry, |job| worker.classify(&job, &error))
+        })
+        .collect();
+    ProcessFailure {
+        error: error.into_worker_error(),
+        kinds,
+    }
+}
+
 #[async_trait::async_trait]
 impl<W, A> Processable for BoundJob<W, A>
 where
     W: Worker<A> + Send + Sync + 'static,
-    A: Job + Send + 'static,
+    A: Job + serde::de::DeserializeOwned + Send + 'static,
 {
-    async fn process(self: Box<Self>, contexts: Vec<JobContext>) -> Result<(), WorkerError> {
+    async fn process(
+        self: Box<Self>,
+        contexts: Vec<JobContext>,
+        args: &[&serde_json::Value],
+    ) -> Result<(), ProcessFailure> {
         assert_eq!(contexts.len(), 1, "single job must have one context");
         let ctx = contexts
             .into_iter()
             .next()
             .expect("single job context exists after length check");
-        self.worker
-            .process(self.job, &ctx)
+        let BoundJob { worker, job } = *self;
+        worker
+            .process(job, &ctx)
             .await
-            .map_err(IntoWorkerError::into_worker_error)
+            .map_err(|error| classify_failure(&worker, args, error))
     }
 
     fn len(&self) -> usize {
@@ -276,24 +350,28 @@ where
 impl<W, A> Processable for BoundBatchJob<W, A>
 where
     W: Worker<A> + Send + Sync + 'static,
-    A: Job + Send + 'static,
+    A: Job + serde::de::DeserializeOwned + Send + 'static,
 {
-    async fn process(self: Box<Self>, contexts: Vec<JobContext>) -> Result<(), WorkerError> {
+    async fn process(
+        self: Box<Self>,
+        contexts: Vec<JobContext>,
+        args: &[&serde_json::Value],
+    ) -> Result<(), ProcessFailure> {
         assert_eq!(
             self.jobs.len(),
             contexts.len(),
             "batch jobs and contexts must have the same length"
         );
-        let items = self
-            .jobs
+        let BoundBatchJob { worker, jobs } = *self;
+        let items = jobs
             .into_iter()
             .zip(contexts)
             .map(|(job, ctx)| BatchItem { job, ctx })
             .collect();
-        self.worker
+        worker
             .run_batch(items)
             .await
-            .map_err(IntoWorkerError::into_worker_error)
+            .map_err(|error| classify_failure(&worker, args, error))
     }
 
     fn len(&self) -> usize {
@@ -328,7 +406,7 @@ mod processable_tests {
     use super::*;
     use serde::Serialize;
 
-    #[derive(Serialize)]
+    #[derive(Serialize, serde::Deserialize)]
     struct LogJob;
 
     impl Job for LogJob {}
@@ -907,6 +985,81 @@ mod tests {
         assert_eq!(
             UnitOnDemandJob::on_demand_args_template(),
             Some(serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn test_define_worker_with_classify() {
+        #[derive(Debug, Serialize, Deserialize, oxana::Job)]
+        struct ClassifiedJob {
+            permanent: bool,
+        }
+
+        fn classify_failure(
+            _worker: &ClassifiedWorker,
+            job: &ClassifiedJob,
+            _error: &WorkerError,
+        ) -> oxana::FailureKind {
+            if job.permanent {
+                oxana::FailureKind::DeadLetter
+            } else {
+                oxana::FailureKind::Retry
+            }
+        }
+
+        #[derive(oxana::Worker)]
+        #[oxana(error = std::io::Error, classify = classify_failure)]
+        struct ClassifiedWorker;
+
+        impl ClassifiedWorker {
+            async fn process(
+                &self,
+                _job: ClassifiedJob,
+                _ctx: &oxana::JobContext,
+            ) -> Result<(), WorkerError> {
+                Ok(())
+            }
+        }
+
+        let error = WorkerError::other("boom");
+        assert_eq!(
+            oxana::Worker::<ClassifiedJob>::classify(
+                &ClassifiedWorker,
+                &ClassifiedJob { permanent: true },
+                &error
+            ),
+            oxana::FailureKind::DeadLetter
+        );
+        assert_eq!(
+            oxana::Worker::<ClassifiedJob>::classify(
+                &ClassifiedWorker,
+                &ClassifiedJob { permanent: false },
+                &error
+            ),
+            oxana::FailureKind::Retry
+        );
+
+        #[derive(oxana::Worker)]
+        #[oxana(job = ClassifiedJob, error = std::io::Error)]
+        struct DefaultWorker;
+
+        impl DefaultWorker {
+            async fn process(
+                &self,
+                _job: ClassifiedJob,
+                _ctx: &oxana::JobContext,
+            ) -> Result<(), WorkerError> {
+                Ok(())
+            }
+        }
+
+        assert_eq!(
+            oxana::Worker::<ClassifiedJob>::classify(
+                &DefaultWorker,
+                &ClassifiedJob { permanent: true },
+                &error
+            ),
+            oxana::FailureKind::Retry
         );
     }
 }

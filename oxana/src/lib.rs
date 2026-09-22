@@ -126,13 +126,14 @@ pub use crate::queue::{
     value_to_queue_key,
 };
 pub use crate::result_collector::Stats as RunStats;
-pub use crate::runtime::RuntimeBuilder;
+pub use crate::runtime::{RuntimeBuilder, ShutdownTimeoutReport};
 pub use crate::stats::*;
 pub use crate::storage::Storage;
 pub use crate::storage_builder::{StorageBuilder, StorageBuilderTimeouts};
+pub use crate::storage_keys::StorageKeys;
 pub use crate::storage_types::*;
 pub use crate::worker::{
-    BatchItem, BoxError, FromContext, IntoWorkerError, Job, Worker, WorkerBatchConfig,
+    BatchItem, BoxError, FailureKind, FromContext, IntoWorkerError, Job, Worker, WorkerBatchConfig,
 };
 pub use crate::worker_registry::{
     OnDemandJobRegistration, WorkerConfig, WorkerConfigKind, job_batch_factory,

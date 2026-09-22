@@ -10,7 +10,6 @@ use crate::queue::{QueueConfig, QueueThrottle};
 use crate::runtime::Runtime;
 use crate::semaphores_map::{QueueControl, QueuePermit};
 use crate::storage_internal::StorageInternal;
-use crate::throttler::Throttler;
 use crate::worker_event::WorkerJob;
 
 pub async fn run<DT>(
@@ -118,8 +117,7 @@ async fn pop_queue_message_w_throttle(
     throttle: &QueueThrottle,
     fallback_wait: Duration,
 ) -> Result<Option<JobId>, OxanaError> {
-    let pool = storage.pool().await?;
-    let throttler = Throttler::new(pool, queue_key, throttle.limit, throttle.window_ms);
+    let throttler = storage.throttler(queue_key, throttle.limit, throttle.window_ms);
 
     let state = throttler.state().await?;
 

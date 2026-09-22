@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -7,9 +9,10 @@ use crate::config::{Config, RuntimeSettings};
 use crate::context::ContextValue;
 use crate::coordinator;
 use crate::error::OxanaError;
+use crate::job_envelope::JobId;
 use crate::queue::QueueConfig;
 use crate::result_collector::Stats;
-use crate::runtime::Runtime;
+use crate::runtime::{Runtime, ShutdownTimeoutReport};
 use crate::storage::Storage;
 use crate::worker_registry::CronJob;
 
@@ -72,11 +75,10 @@ where
     }
 
     tracing::info!("Shutting down");
-    let deadline = tokio::time::Instant::now() + runtime.settings.shutdown_timeout;
     runtime.cancel_token.cancel();
     runtime.tasks.close();
 
-    let drained = tokio::time::timeout_at(deadline, async {
+    let drain = async {
         while let Some(task_result) = coordinator_joinset.join_next().await {
             record_task_result(&runtime, task_result);
         }
@@ -96,11 +98,14 @@ where
         if let Err(error) = runtime.storage.internal.self_cleanup().await {
             runtime.fail(error);
         }
-    })
-    .await;
+    };
+    // `timeout` clamps a duration too large to add to an Instant, so a
+    // "wait however long" timeout drains without a deadline instead of panicking.
+    let drained = tokio::time::timeout(runtime.settings.shutdown_timeout, drain).await;
 
     if drained.is_err() {
-        tracing::error!("Shutdown timeout reached; cancelling remaining owned tasks");
+        // A deadline is configuration, not a fault: warn, not error.
+        tracing::warn!("Shutdown timeout reached; cancelling remaining owned tasks");
         runtime.force_cancel_token.cancel();
         abort_and_join(&runtime, &mut coordinator_joinset).await;
         abort_and_join(&runtime, &mut joinset).await;
@@ -110,8 +115,10 @@ where
         ping_cancel_token.cancel();
         abort_and_join(&runtime, &mut ping_joinset).await;
         tracing::warn!("Forced cancellation complete; interrupted jobs retained for resurrection");
-        // No fresh Redis timeout after the deadline. Registration can expire
-        // naturally, and the replacement process will recover processing lists.
+        // Registration is left to expire naturally, and the replacement
+        // process will recover the processing list. Reading that list is the
+        // one Redis round trip made after the deadline, and it is bounded.
+        report_shutdown_timeout(&runtime).await;
     }
 
     debug_assert!(runtime.tasks.is_empty());
@@ -128,10 +135,74 @@ where
             tracing::info!("Gracefully shut down");
             Ok(stats)
         }
+        Some(error @ OxanaError::ShutdownTimeout) => {
+            tracing::warn!(error = %error, "Shut down at the deadline");
+            Err(error)
+        }
         Some(error) => {
             tracing::error!(error = %error, "Shut down with error");
             Err(error)
         }
+    }
+}
+
+/// How long a timed-out shutdown waits to read the interrupted jobs.
+const SHUTDOWN_REPORT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Reads which jobs this process still holds and hands them to the caller's
+/// `on_shutdown_timeout` callback, logging each one.
+async fn report_shutdown_timeout<DT>(runtime: &Runtime<DT>)
+where
+    DT: Send + Sync + Clone + 'static,
+{
+    let storage = &runtime.storage.internal;
+    let interrupted = match tokio::time::timeout(
+        SHUTDOWN_REPORT_TIMEOUT,
+        storage.processing_job_ids(),
+    )
+    .await
+    {
+        Ok(Ok(interrupted)) => Some(interrupted),
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "Could not read the interrupted jobs after the shutdown timeout");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("Timed out reading the interrupted jobs after the shutdown timeout");
+            None
+        }
+    };
+    let report = ShutdownTimeoutReport {
+        read: interrupted.is_some(),
+        interrupted: interrupted.unwrap_or_default(),
+    };
+
+    if !report.interrupted.is_empty() {
+        // Best effort: the queue names make the log useful, but the ids are
+        // the report, and it must not depend on a second read.
+        let queues: HashMap<JobId, String> = match tokio::time::timeout(
+            SHUTDOWN_REPORT_TIMEOUT,
+            storage.get_many(&report.interrupted),
+        )
+        .await
+        {
+            Ok(Ok(envelopes)) => envelopes
+                .into_iter()
+                .map(|envelope| (envelope.id, envelope.queue))
+                .collect(),
+            Ok(Err(_)) | Err(_) => HashMap::new(),
+        };
+        for job_id in &report.interrupted {
+            tracing::warn!(
+                job_id = job_id,
+                queue = queues.get(job_id).map(String::as_str).unwrap_or_default(),
+                "Job interrupted by the shutdown timeout; retained for resurrection"
+            );
+        }
+    }
+
+    if let Some(reporter) = &runtime.settings.shutdown_timeout_reporter {
+        reporter(&report);
     }
 }
 

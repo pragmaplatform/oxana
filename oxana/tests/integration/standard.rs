@@ -373,6 +373,30 @@ pub async fn test_shutdown_keeps_heartbeat_until_workers_finish() -> TestResult 
     Ok(())
 }
 
+type CapturedReport = Arc<std::sync::Mutex<Option<oxana::ShutdownTimeoutReport>>>;
+
+/// A slot and the `on_shutdown_timeout` callback that fills it.
+fn capture_shutdown_report() -> (
+    CapturedReport,
+    impl Fn(&oxana::ShutdownTimeoutReport) + Send + Sync + 'static,
+) {
+    let report: CapturedReport = Arc::default();
+    let slot = Arc::clone(&report);
+    (report, move |timeout: &oxana::ShutdownTimeoutReport| {
+        slot.lock().unwrap().replace(timeout.clone());
+    })
+}
+
+trait TakeReport {
+    fn take(&self) -> Option<oxana::ShutdownTimeoutReport>;
+}
+
+impl TakeReport for CapturedReport {
+    fn take(&self) -> Option<oxana::ShutdownTimeoutReport> {
+        self.lock().unwrap().take()
+    }
+}
+
 #[derive(Clone)]
 struct BlockedShutdownState {
     started: tokio::sync::mpsc::UnboundedSender<usize>,
@@ -470,6 +494,7 @@ async fn bounded_shutdown<const BATCH: bool>(trigger: ShutdownTrigger) -> TestRe
     let lifetime = Arc::downgrade(&state.lifetime);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let deadline = Duration::from_millis(300);
+    let (report, capture) = capture_shutdown_report();
     let runtime = storage
         .runtime(state)
         .queue_with_concurrency::<QueueOne>(2)
@@ -478,6 +503,7 @@ async fn bounded_shutdown<const BATCH: bool>(trigger: ShutdownTrigger) -> TestRe
         .heartbeat_interval(Duration::from_millis(25))
         .shutdown_timeout(deadline)
         .redis_failure_tolerance(1)
+        .on_shutdown_timeout(capture)
         .shutdown_on(async move {
             shutdown_rx.await.unwrap();
             Ok(())
@@ -578,6 +604,14 @@ async fn bounded_shutdown<const BATCH: bool>(trigger: ShutdownTrigger) -> TestRe
     for job_id in &job_ids {
         assert!(interrupted.contains(job_id));
     }
+    // The cancelled jobs are reported to the caller, read from Redis.
+    let report = report.take().expect("timeout must be reported");
+    assert!(report.read);
+    let mut reported = report.interrupted.clone();
+    reported.sort();
+    let mut expected = interrupted.clone();
+    expected.sort();
+    assert_eq!(reported, expected);
     let heartbeat: Option<f64> = redis.zscore(&processes_key, &old_processes[0]).await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let later: Option<f64> = redis.zscore(&processes_key, &old_processes[0]).await?;
@@ -637,6 +671,183 @@ async fn test_shutdown_deadline_preserves_error_with_blocked_batches() -> TestRe
 #[tokio::test]
 async fn test_shutdown_deadline_preserves_background_redis_error() -> TestResult {
     bounded_shutdown::<true>(ShutdownTrigger::BackgroundFailure).await
+}
+
+#[derive(Clone)]
+struct CutCompletionState {
+    pool: deadpool_redis::Pool,
+    started: Arc<Notify>,
+    go: Arc<Notify>,
+    hold: Duration,
+}
+
+struct CutCompletionWorker(CutCompletionState);
+
+impl oxana::FromContext<CutCompletionState> for CutCompletionWorker {
+    fn from_context(ctx: &CutCompletionState) -> Self {
+        Self(ctx.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl oxana::Worker<BlockedShutdownJob> for CutCompletionWorker {
+    type Error = std::io::Error;
+
+    async fn process(
+        &self,
+        _job: BlockedShutdownJob,
+        _ctx: &oxana::JobContext,
+    ) -> Result<(), Self::Error> {
+        self.0.started.notify_one();
+        self.0.go.notified().await;
+        // Take the pool's only connection with us: the handler returns, but
+        // the runtime cannot write the completion until the connection is back.
+        let connection = self.0.pool.get().await.map_err(std::io::Error::other)?;
+        let hold = self.0.hold;
+        tokio::spawn(async move {
+            let _connection = connection;
+            tokio::time::sleep(hold).await;
+        });
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_shutdown_timeout_reports_a_job_whose_completion_was_cut() -> TestResult {
+    setup();
+    let namespace = random_string();
+    let mut cfg = deadpool_redis::Config::from_url(std::env::var("REDIS_URL")?);
+    cfg.pool = Some(deadpool_redis::PoolConfig {
+        max_size: 1,
+        timeouts: deadpool_redis::Timeouts {
+            wait: Some(Duration::from_secs(5)),
+            create: Some(Duration::from_secs(1)),
+            recycle: Some(Duration::from_secs(1)),
+        },
+        ..Default::default()
+    });
+    let pool = cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1))?;
+    let storage = oxana::Storage::builder()
+        .namespace(namespace.clone())
+        .build_from_pool(pool.clone())?;
+    let state = CutCompletionState {
+        pool: pool.clone(),
+        started: Arc::new(Notify::new()),
+        go: Arc::new(Notify::new()),
+        hold: Duration::from_millis(1500),
+    };
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (report, capture) = capture_shutdown_report();
+    let runtime = storage
+        .runtime(state.clone())
+        .queue::<QueueOne>()
+        .worker::<CutCompletionWorker, BlockedShutdownJob>()
+        .heartbeat_interval(Duration::from_millis(50))
+        .shutdown_timeout(Duration::from_millis(300))
+        .on_shutdown_timeout(capture)
+        .shutdown_on(async move {
+            shutdown_rx.await.unwrap();
+            Ok(())
+        });
+    let job_id = storage.enqueue(QueueOne, BlockedShutdownJob).await?;
+    let runner = tokio::spawn(runtime.run());
+
+    tokio::time::timeout(Duration::from_secs(5), state.started.notified()).await?;
+    shutdown_tx.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    state.go.notify_one();
+
+    let result = tokio::time::timeout(Duration::from_secs(10), runner).await??;
+    assert!(
+        matches!(result, Err(oxana::OxanaError::ShutdownTimeout)),
+        "{result:?}"
+    );
+
+    // The handler returned, but the completion never reached Redis: the job
+    // is still filed for the next process to run again, and the caller is told.
+    assert!(storage.get_job(&job_id).await?.is_some());
+    let mut redis = crate::shared::redis_pool().get().await?;
+    let processes: Vec<String> = redis
+        .zrange(format!("{namespace}:processes"), 0, -1)
+        .await?;
+    assert_eq!(processes.len(), 1, "process record must be kept");
+    let interrupted: Vec<String> = redis
+        .lrange(format!("{namespace}:processing:{}", processes[0]), 0, -1)
+        .await?;
+    assert_eq!(interrupted, vec![job_id.clone()]);
+    let report = report.take().expect("timeout must be reported");
+    assert!(report.read, "the processing list must be read, not guessed");
+    assert_eq!(report.interrupted, vec![job_id]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_clean_drain_reports_no_shutdown_timeout() -> TestResult {
+    let redis_pool = setup();
+    let storage = oxana::Storage::builder()
+        .namespace(random_string())
+        .build_from_pool(redis_pool.clone())?;
+    let ctx = WorkerState { redis: redis_pool };
+    storage
+        .enqueue(
+            QueueOne,
+            WorkerRedisSetJob {
+                key: random_string(),
+                value: "value".to_string(),
+            },
+        )
+        .await?;
+    let reported = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let runtime = storage
+        .runtime(ctx)
+        .queue::<QueueOne>()
+        .worker::<WorkerRedisSet, WorkerRedisSetJob>()
+        .shutdown_timeout(Duration::from_secs(5))
+        .on_shutdown_timeout({
+            let reported = Arc::clone(&reported);
+            move |_| reported.store(true, std::sync::atomic::Ordering::SeqCst)
+        })
+        .exit_when_processed(1);
+
+    let stats = tokio::time::timeout(Duration::from_secs(5), runtime.run()).await??;
+
+    assert_eq!(stats.processed, 1);
+    assert!(!reported.load(std::sync::atomic::Ordering::SeqCst));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_shutdown_timeout_beyond_instant_range_drains_without_deadline() -> TestResult {
+    let redis_pool = setup();
+    let storage = oxana::Storage::builder()
+        .namespace(random_string())
+        .build_from_pool(redis_pool.clone())?;
+    let ctx = WorkerState { redis: redis_pool };
+    let job_id = storage
+        .enqueue(
+            QueueOne,
+            WorkerRedisSetJob {
+                key: random_string(),
+                value: "value".to_string(),
+            },
+        )
+        .await?;
+    let runtime = storage
+        .runtime(ctx)
+        .queue::<QueueOne>()
+        .worker::<WorkerRedisSet, WorkerRedisSetJob>()
+        // "Wait for the jobs however long": too large to add to an Instant.
+        .shutdown_timeout(Duration::from_secs(u64::MAX))
+        .exit_when_processed(1);
+
+    let stats = tokio::time::timeout(Duration::from_secs(5), runtime.run()).await??;
+
+    assert_eq!(stats.processed, 1);
+    assert!(storage.get_job(&job_id).await?.is_none());
+
+    Ok(())
 }
 
 #[tokio::test]

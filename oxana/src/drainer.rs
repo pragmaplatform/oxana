@@ -146,14 +146,16 @@ where
         state: JobState::new(storage.clone(), job_id, envelope.meta.state.clone()),
     };
 
-    let job_result = job.process(vec![job_ctx]).await;
+    let job_result = job.process(vec![job_ctx], &[&envelope.job.args]).await;
 
     match job_result {
         Ok(()) => {
             storage.internal.finish_with_success(&envelope).await?;
             Ok(ProcessJobResult::Success)
         }
-        Err(e) => {
+        Err(failure) => {
+            // A drain never retries, so the classification is moot here.
+            let e = failure.error;
             tracing::error!("Job failed: {}", e);
             storage.internal.finish_with_failure(&envelope).await?;
             storage

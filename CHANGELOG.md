@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `Storage::try_enqueue`, `try_enqueue_in`, `try_enqueue_at`, `try_enqueue_list` and `try_enqueue_envelope` return an `EnqueueOutcome` — `Enqueued`, `Replaced` or `Duplicate { existing }` — where the job ID alone could not tell a filed job from a unique job that was skipped.
+- `RuntimeBuilder::on_shutdown_timeout` receives a `ShutdownTimeoutReport` when the `shutdown_timeout` deadline is reached: the jobs still in this process's processing list once the remaining tasks were cancelled, read from Redis (`read: false` when it could not be), including a job whose handler returned just before the deadline but whose completion write was cut. Each interrupted job is also logged at `warn` with its `job_id` and `queue`; the deadline itself is now logged at `warn` rather than `error`.
+- `StorageKeys` is public, with `StorageKeys::new(namespace)` reproducing the default layout and `with_*` methods overriding one key or prefix each, and `StorageBuilder::keys` accepts it. The throttle window prefix is now a field of the layout, defaulting to the `oxana:throttler` prefix every release so far has used, so it can be brought under the namespace. Nothing moves for existing deployments.
+- `Worker::classify(&self, job, error) -> FailureKind` lets a worker dead-letter a job at once (`FailureKind::DeadLetter`) when the attempt showed it can never succeed, instead of re-running the handler until `max_retries` is spent. The default keeps the retry budget as the only policy. `#[derive(oxana::Worker)]` accepts `#[oxana(classify = path)]`.
+
+### Fixed
+
+- `shutdown_timeout` values too large to add to an instant, such as `Duration::from_secs(u64::MAX)`, no longer panic the runtime at shutdown; they disable the deadline, as they did before it existed.
+- A queue throttle window is no longer rounded down to whole seconds: a 500ms window limits, and a 1500ms window is not cut to one second.
+- The uniqueness check and the enqueue of a unique job happen in one Redis script. Two pushes racing on one unique ID used to both see it free and both enqueue; a push that saw it taken was skipped while returning `Ok` with an ID. Concurrent pushes now file exactly one job, and a replacing push that finds the job moved queues re-reads it rather than leaving it on two queues.
+- A due job is claimed from its schedule and pushed onto its queue in one Redis script. A process dying between the two steps used to lose the job, and a cancel arriving between them answered `false` while the job then ran.
+
 ## [2.1.10] - 2026-09-21
 
 ### Added

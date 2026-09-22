@@ -1,7 +1,54 @@
 use serde::{Deserialize, Serialize};
 
 use crate::worker_registry::JobEnvelopeFactory;
-use crate::{JobEnvelope, OxanaError};
+use crate::{JobEnvelope, JobId, OxanaError};
+
+/// What an enqueue call did with the job.
+///
+/// Returned by [`Storage::try_enqueue`](crate::Storage::try_enqueue) and its
+/// siblings. The plain `enqueue` methods return the job ID alone, which cannot
+/// tell a filed job from a unique job that was skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EnqueueOutcome {
+    /// The job was stored and filed on its queue or schedule.
+    Enqueued(JobId),
+    /// A unique job with the same ID existed and was replaced by this one.
+    Replaced(JobId),
+    /// A unique job with the same ID already exists; nothing was written.
+    Duplicate {
+        /// The ID of the job that is already filed.
+        existing: JobId,
+    },
+}
+
+impl EnqueueOutcome {
+    /// The ID of the job now filed under this key, whether it is the job that
+    /// was pushed or the one that was already there.
+    pub fn job_id(&self) -> &JobId {
+        match self {
+            Self::Enqueued(id) | Self::Replaced(id) | Self::Duplicate { existing: id } => id,
+        }
+    }
+
+    /// Consumes the outcome, returning the job ID as [`job_id`](Self::job_id) does.
+    pub fn into_job_id(self) -> JobId {
+        match self {
+            Self::Enqueued(id) | Self::Replaced(id) | Self::Duplicate { existing: id } => id,
+        }
+    }
+
+    /// Whether the pushed job was written, either as a new job or by replacing
+    /// an existing unique job.
+    pub fn is_enqueued(&self) -> bool {
+        matches!(self, Self::Enqueued(_) | Self::Replaced(_))
+    }
+
+    /// Whether the push was skipped because a unique job already exists.
+    pub fn is_duplicate(&self) -> bool {
+        matches!(self, Self::Duplicate { .. })
+    }
+}
 
 /// Options for listing jobs in a queue.
 #[derive(Debug, Clone, Serialize, Deserialize)]

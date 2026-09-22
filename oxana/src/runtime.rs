@@ -5,11 +5,14 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::config::{Config, ErrorFormatterFn, RetryDelayOverrideFn, RuntimeSettings};
+use crate::config::{
+    Config, ErrorFormatterFn, RetryDelayOverrideFn, RuntimeSettings, ShutdownTimeoutReporterFn,
+};
 use crate::context::ContextValue;
 use crate::drainer::{self, DrainStats};
 use crate::error::OxanaError;
 use crate::failure::{FailureReporterFn, WorkerFailureReport};
+use crate::job_envelope::JobId;
 use crate::queue::{Queue, QueueConcurrency, QueueConfig, require_non_zero_duration};
 use crate::result_collector::Stats as RunStats;
 use crate::storage::Storage;
@@ -18,6 +21,21 @@ use crate::worker::{FromContext, Job, Worker};
 
 #[cfg(feature = "registry")]
 use crate::registry::RegisterComponents;
+
+/// What a timed-out shutdown left behind, handed to the callback set with
+/// [`RuntimeBuilder::on_shutdown_timeout`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ShutdownTimeoutReport {
+    /// The jobs still in this process's processing list once the remaining
+    /// tasks were cancelled and joined. They stay filed and run again once a
+    /// peer's sweep resurrects them. Empty when `read` is `false`.
+    pub interrupted: Vec<JobId>,
+    /// Whether `interrupted` was read from Redis. `false` when Redis could not
+    /// be reached within the bounded wait, in which case nothing is known
+    /// about the interrupted jobs rather than guessed.
+    pub read: bool,
+}
 
 pub struct RuntimeBuilder<DT>
 where
@@ -169,8 +187,42 @@ where
     /// joined. Interrupted jobs remain available to the resurrection mechanism.
     /// [`Self::run`] returns [`OxanaError::ShutdownTimeout`] after an ordinary
     /// shutdown signal, or the initiating error if a task failure caused shutdown.
+    ///
+    /// A timed-out drain deliberately keeps this process's record and
+    /// processing list in Redis: the record expires by
+    /// [`dead_process_threshold`](Self::dead_process_threshold) and a peer's
+    /// sweep then puts the interrupted jobs back on their queues. Removing the
+    /// record at the deadline would leave the list to be swept immediately,
+    /// while a handler may still be unwinding. To learn which jobs were
+    /// interrupted, see [`on_shutdown_timeout`](Self::on_shutdown_timeout).
+    ///
+    /// A timeout too large to add to the current instant, such as
+    /// `Duration::MAX`, disables the deadline: the drain waits however long
+    /// the jobs take.
     pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.settings.shutdown_timeout = timeout;
+        self
+    }
+
+    /// Sets a callback that receives the [`ShutdownTimeoutReport`] when the
+    /// [`shutdown_timeout`](Self::shutdown_timeout) deadline is reached.
+    ///
+    /// It runs once, after the remaining tasks have been cancelled and joined
+    /// and before [`Self::run`] returns, and never on a clean drain. The
+    /// report lists the jobs this process still holds in its processing list
+    /// at that point — those cancelled mid-flight, and those whose handler
+    /// returned but whose completion write was cut — read from Redis with a
+    /// bounded wait. When Redis cannot be read, the report says so rather
+    /// than guessing.
+    ///
+    /// The runtime also logs each interrupted job at `warn` with its `job_id`
+    /// and `queue`.
+    pub fn on_shutdown_timeout(
+        mut self,
+        f: impl Fn(&ShutdownTimeoutReport) + Send + Sync + 'static,
+    ) -> Self {
+        self.settings.shutdown_timeout_reporter =
+            Some(Arc::new(f) as Arc<ShutdownTimeoutReporterFn>);
         self
     }
 

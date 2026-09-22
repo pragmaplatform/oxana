@@ -143,6 +143,7 @@ Jobs carry the data that gets enqueued and define enqueue-time metadata. Workers
 | `#[oxana(on_demand)]` - expose the job in the web dashboard for manual enqueueing | `#[oxana(retry_delay = 5)]` - set retry delay in seconds |
 |  | `#[oxana(cron(schedule = "*/5 * * * * *", queue = MyQueue))]` - schedule periodic jobs |
 |  | `#[oxana(batch_size = 100, batch_timeout_ms = 500)]` - process jobs in batches |
+|  | `#[oxana(classify = my_fn)]` - decide after a failed attempt whether to retry or dead-letter |
 
 Cron jobs may define a `unique_id` to prevent overlapping occurrences. Their conflict strategy
 must be `Skip`; `on_conflict = Replace` is rejected because replacing an in-flight occurrence can
@@ -153,6 +154,29 @@ For job hooks, `Self::...` resolves to the job type. For worker hooks, `Self::..
 On-demand argument templates infer editable placeholders from field types. Numeric primitives and common numeric ID newtypes named `*Id` or `*ID` are prefilled with `0`.
 
 Batch workers use all-or-nothing result semantics: if `process_batch` returns `Ok(())`, every job in the batch is marked successful; if it returns an error or panics, every job in that batch follows the normal retry or failure path. Batch handlers should therefore be idempotent, or should only commit external side effects after the whole batch is ready to succeed.
+
+`max_retries` settles the retry budget before the handler runs. A worker that learns *during* the
+attempt that a payload can never succeed (a malformed message, an unknown target) can dead-letter it
+at once with `Worker::classify`, instead of re-running the handler — side effects included — until
+the budget is spent:
+
+```rust
+fn classify(&self, _job: &MyJob, error: &MyError) -> oxana::FailureKind {
+    match error {
+        MyError::Malformed(_) => oxana::FailureKind::DeadLetter,
+        _ => oxana::FailureKind::Retry,
+    }
+}
+```
+
+The default returns `FailureKind::Retry`, which keeps the retry budget as the only policy. Panics
+are never classified. With `#[derive(oxana::Worker)]`, point `#[oxana(classify = path)]` at a
+`fn(&Worker, &Job, &Error) -> FailureKind`.
+
+Unique jobs are checked and written in one Redis step, so concurrent pushes on one unique ID file
+exactly one job. `enqueue` returns the job ID either way; `try_enqueue`, `try_enqueue_in`,
+`try_enqueue_at`, `try_enqueue_list` and `try_enqueue_envelope` return an `EnqueueOutcome` that tells
+a filed job (`Enqueued`, `Replaced`) from a skipped one (`Duplicate { existing }`).
 
 ### Queues
 
@@ -183,6 +207,20 @@ The component registry automatically discovers and registers all workers and que
 Build it with `Storage::from_env()` or `Storage::builder().build_from_env()`, which read the `REDIS_URL` environment variable.
 Set `REDIS_STATS_URL` to store counters and metrics in a separate Redis instance; when it is not set, stats use `REDIS_URL`.
 Call `storage.runtime(ctx)` to create a typed worker runtime, register queues and workers on that runtime, then call `runtime.run().await`.
+
+Every Redis key lives under the namespace set with `Storage::builder().namespace(..)`, except the
+throttle windows, which have always lived under `oxana:throttler`. Operators who scope Redis ACLs or
+`SCAN`s to one structure, or who run several deployments on one logical database, can choose the
+layout with `StorageKeys`; `StorageKeys::new(namespace)` is the default layout, and each `with_*`
+overrides one key or prefix:
+
+```rust
+let keys = oxana::StorageKeys::new("app")
+    .with_queue_prefix("app:pending")
+    .with_processes_data("app:process-records")
+    .with_throttler_prefix("app:throttle");
+let storage = oxana::Storage::builder().keys(keys).build_from_env()?;
+```
 
 ### Context
 
@@ -256,6 +294,26 @@ Excluding a dynamic queue excludes all of its discovered subqueues. Cron jobs
 for excluded queues are not scheduled.
 
 `Storage` remains the enqueueing and monitoring handle; `RuntimeBuilder<C>` is the worker setup and execution handle for app context type `C`.
+
+`shutdown_timeout` bounds the drain. At the deadline the remaining tasks are cancelled, `run`
+returns `OxanaError::ShutdownTimeout`, and this process's record and processing list are
+deliberately kept so that a peer's sweep resurrects the interrupted jobs. To learn which jobs
+those are — including a job whose handler returned just before the deadline but whose completion
+write was cut — register `on_shutdown_timeout`:
+
+```rust
+let runtime = storage
+    .runtime(ctx)
+    .shutdown_timeout(Duration::from_secs(30))
+    .on_shutdown_timeout(|report| {
+        if report.read {
+            tracing::warn!(jobs = ?report.interrupted, "jobs will run again elsewhere");
+        }
+    });
+```
+
+The report is read from Redis, never guessed: `read` is `false` when Redis could not be reached. The
+runtime also logs each interrupted job at `warn` with its `job_id` and `queue`.
 
 Worker errors use their `Debug` representation by default so error types that capture backtraces
 can include them in the dashboard. Applications can override the stored representation when needed:
