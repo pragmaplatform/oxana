@@ -268,8 +268,26 @@ let runtime = storage
 
 With the `sentry` feature enabled, failed executions are reported once by default with isolated
 `oxana.*` tags and an `oxana` context containing job IDs, queue/job/worker names, batch size, and
-per-job arguments and retry state. Applications that need an error-specific integration can replace
-the capture while retaining the original concrete worker error:
+per-job arguments and retry state. To customize events for returned errors while retaining this
+metadata, worker scope, and built-in panic reporting, use `sentry_error_event_builder`:
+
+```rust
+let runtime = storage.runtime(ctx).sentry_error_event_builder(|error| {
+    match error.downcast_ref::<ApplicationError>() {
+        Some(error) => error.sentry_event(),
+        None => sentry_core::event_from_error(error),
+    }
+});
+```
+
+Return an event without capturing it; Oxana submits it once. The default builder uses
+`sentry_core::event_from_error`, which formats errors with `Debug`. Applications avoiding native
+backtrace resolution should build events from safe messages and recorded locations, and also use
+safe `Debug` output or an `error_formatter` for the dashboard. The event builder runs only for
+returned errors when a Sentry client is active.
+
+Applications that need to replace all reporting, including panic handling, can instead use
+`failure_reporter`. It takes precedence over `sentry_error_event_builder`:
 
 ```rust
 let runtime = storage.runtime(ctx).failure_reporter(|report| {
