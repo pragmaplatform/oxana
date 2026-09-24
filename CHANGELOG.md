@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-09-24
+
+### Added
+
+- Add `RuntimeBuilder::sentry_error_event_builder` to customize Sentry events for returned worker errors while preserving worker scope, job and retry metadata, and built-in panic reporting. A configured `failure_reporter` takes precedence.
+
+### Changed
+
+- `JobMeta` gains an optional `on_demand` field. Existing serialized jobs remain compatible; code constructing `JobMeta` literals must supply the new field.
+- Include `oxana-mcp` in automated crate publishing.
+
+### Fixed
+
+- Mark jobs enqueued through the on-demand catalog with `on_demand: Some(true)` and preserve the marker across serialization and retries.
+
 ## [2.1.10] - 2026-09-21
 
 ### Added
