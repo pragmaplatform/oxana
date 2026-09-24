@@ -825,6 +825,7 @@ fn legacy_worker_named_envelope(queue: &str) -> oxana::JobEnvelope {
         },
         meta: oxana::JobMeta {
             id,
+            on_demand: None,
             retries: 0,
             unique: false,
             on_conflict: None,

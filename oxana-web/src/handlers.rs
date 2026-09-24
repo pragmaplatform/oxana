@@ -1082,6 +1082,7 @@ fn immediate_envelope(
         job: oxana::JobData { name, args },
         meta: oxana::JobMeta {
             id,
+            on_demand: None,
             retries: 0,
             unique: false,
             on_conflict: None,
@@ -2004,6 +2005,8 @@ mod tests {
             },
         )
         .expect("valid on-demand form should build an envelope");
+
+        assert_eq!(envelope.meta.on_demand, Some(true));
 
         assert_eq!(envelope.queue, "default");
         assert_eq!(

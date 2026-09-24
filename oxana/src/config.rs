@@ -693,6 +693,7 @@ mod tests {
             .expect("on-demand factory should build typed envelope");
 
         assert_eq!(envelope.queue, "manual");
+        assert_eq!(envelope.meta.on_demand, Some(true));
         assert_eq!(envelope.id, format!("{}/alpha_7", AlphaJob::name()));
         assert!(envelope.meta.unique);
         assert_eq!(

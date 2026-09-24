@@ -507,6 +507,7 @@ fn invalid_batch_envelope(values_key: String, calls_key: String) -> oxana::JobEn
         },
         meta: oxana::JobMeta {
             id,
+            on_demand: None,
             retries: 0,
             unique: false,
             on_conflict: None,

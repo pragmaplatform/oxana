@@ -3889,6 +3889,7 @@ mod tests {
             },
             meta: crate::job_envelope::JobMeta {
                 id: id.clone(),
+                on_demand: None,
                 retries: 0,
                 unique: false,
                 on_conflict: None,
@@ -3932,6 +3933,7 @@ mod tests {
             },
             meta: crate::job_envelope::JobMeta {
                 id: id.clone(),
+                on_demand: None,
                 retries: 0,
                 unique: false,
                 on_conflict: None,
@@ -4019,6 +4021,7 @@ mod tests {
             },
             meta: crate::job_envelope::JobMeta {
                 id: id.clone(),
+                on_demand: None,
                 retries: 0,
                 unique: true,
                 on_conflict: Some(JobConflictStrategy::Replace),
