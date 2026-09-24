@@ -42,7 +42,9 @@ impl OnDemandJobInfo {
         queue: String,
         args: serde_json::Value,
     ) -> Result<JobEnvelope, OxanaError> {
-        (self.enqueue_factory)(queue, args)
+        let mut envelope = (self.enqueue_factory)(queue, args)?;
+        envelope.meta.on_demand = Some(true);
+        Ok(envelope)
     }
 }
 

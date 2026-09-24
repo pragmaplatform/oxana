@@ -1089,6 +1089,7 @@ mod job_card_tests {
             },
             meta: oxana::JobMeta {
                 id: id.to_string(),
+                on_demand: None,
                 retries: 0,
                 unique: false,
                 on_conflict: None,

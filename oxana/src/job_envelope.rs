@@ -47,6 +47,9 @@ fn default_resurrect() -> bool {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct JobMeta {
     pub id: JobId,
+    /// Whether this job was enqueued through the on-demand catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_demand: Option<bool>,
     pub retries: u32,
     pub unique: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,6 +93,7 @@ impl JobEnvelope {
             },
             meta: JobMeta {
                 id,
+                on_demand: None,
                 retries: 0,
                 unique,
                 on_conflict: if unique {
@@ -145,6 +149,7 @@ impl JobEnvelope {
                 },
                 meta: JobMeta {
                     id,
+                    on_demand: None,
                     retries: 0,
                     unique: true,
                     on_conflict: Some(on_conflict),
@@ -179,6 +184,7 @@ impl JobEnvelope {
             job: self.job,
             meta: JobMeta {
                 id: self.id,
+                on_demand: self.meta.on_demand,
                 retries: self.meta.retries + 1,
                 unique: self.meta.unique,
                 on_conflict: self.meta.on_conflict,
@@ -239,6 +245,7 @@ mod tests {
     fn make_meta(scheduled_at: i64, started_at: Option<i64>) -> JobMeta {
         JobMeta {
             id: "test".to_string(),
+            on_demand: None,
             retries: 0,
             unique: false,
             on_conflict: None,
@@ -256,6 +263,38 @@ mod tests {
     fn test_started_at_none() {
         let meta = make_meta(1_000_000, None);
         assert!(meta.started_at().is_none());
+    }
+
+    #[test]
+    fn on_demand_metadata_survives_serialization_and_retries() {
+        #[derive(Serialize)]
+        struct TestJob {}
+
+        impl Job for TestJob {}
+
+        let mut envelope = JobEnvelope::new("default".to_string(), TestJob {}).unwrap();
+        assert_eq!(envelope.meta.on_demand, None);
+        envelope.meta.on_demand = Some(true);
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        let restored: JobEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.meta.on_demand, Some(true));
+        assert_eq!(
+            restored
+                .with_retries_incremented("retry".to_string())
+                .meta
+                .on_demand,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn absent_on_demand_metadata_is_omitted_and_defaults_to_none() {
+        let json = serde_json::to_value(make_meta(1_000_000, None)).unwrap();
+        assert!(json.get("on_demand").is_none());
+
+        let meta: JobMeta = serde_json::from_value(json).unwrap();
+        assert_eq!(meta.on_demand, None);
     }
 
     #[test]
@@ -310,6 +349,7 @@ mod tests {
             },
             meta: JobMeta {
                 id: "test".to_string(),
+                on_demand: None,
                 retries: 0,
                 unique: false,
                 on_conflict: None,
@@ -340,6 +380,7 @@ mod tests {
             },
             meta: JobMeta {
                 id: "test".to_string(),
+                on_demand: None,
                 retries: 0,
                 unique: false,
                 on_conflict: None,
@@ -359,6 +400,7 @@ mod tests {
         let drift_micros = Utc::now().timestamp_micros() - envelope.meta.scheduled_at;
         assert!(drift_micros >= 0);
         assert!(drift_micros < 1_000_000);
+        assert_eq!(envelope.meta.on_demand, None);
     }
 
     #[test]
