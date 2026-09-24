@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::future::Future;
+#[cfg(any(feature = "sentry", test))]
 use std::sync::Arc;
 #[cfg(feature = "sentry")]
 use std::sync::Mutex;
@@ -7,6 +8,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 
 use crate::JobId;
+use crate::config::RuntimeSettings;
 
 /// The cause of a failed worker execution.
 ///
@@ -154,17 +156,17 @@ impl ExecutionSentryHub {
 }
 
 pub(crate) fn report_failure(
-    reporter: Option<&Arc<FailureReporterFn>>,
+    settings: &RuntimeSettings,
     report: WorkerFailureReport<'_>,
     execution_hub: &ExecutionSentryHub,
 ) {
-    if let Some(reporter) = reporter {
+    if let Some(reporter) = &settings.failure_reporter {
         on_execution_sentry_hub(execution_hub, || reporter(report));
         return;
     }
 
     #[cfg(feature = "sentry")]
-    default_sentry_report(report, execution_hub);
+    default_sentry_report(settings, report, execution_hub);
 }
 
 #[cfg(feature = "sentry")]
@@ -204,10 +206,20 @@ where
 }
 
 #[cfg(feature = "sentry")]
-fn default_sentry_report(report: WorkerFailureReport<'_>, execution_hub: &ExecutionSentryHub) {
+fn default_sentry_report(
+    settings: &RuntimeSettings,
+    report: WorkerFailureReport<'_>,
+    execution_hub: &ExecutionSentryHub,
+) {
     match report.failure {
         WorkerFailure::Error(error) => with_failure_sentry_scope(report, execution_hub, || {
-            sentry_core::capture_error(error);
+            sentry_core::Hub::with_active(|hub| {
+                let event = settings.sentry_error_event_builder.as_ref().map_or_else(
+                    || sentry_core::event_from_error(error),
+                    |builder| builder(error),
+                );
+                hub.capture_event(event);
+            });
         }),
         WorkerFailure::Panic { message } => {
             let event = execution_hub
@@ -377,7 +389,9 @@ mod tests {
 
     fn report_failure(reporter: Option<&Arc<FailureReporterFn>>, report: WorkerFailureReport<'_>) {
         let execution_hub = execution_sentry_hub();
-        super::report_failure(reporter, report, &execution_hub);
+        let mut settings = RuntimeSettings::default();
+        settings.failure_reporter = reporter.cloned();
+        super::report_failure(&settings, report, &execution_hub);
     }
 
     #[test]
@@ -453,6 +467,92 @@ mod tests {
     #[cfg(feature = "sentry")]
     fn tag<'a>(event: &'a sentry_core::protocol::Event<'_>, key: &str) -> &'a str {
         event.tags.get(key).map(String::as_str).expect("event tag")
+    }
+
+    #[cfg(feature = "sentry")]
+    #[test]
+    fn error_event_builder_avoids_debug_and_preserves_scope_and_metadata() {
+        struct DisplayOnlyError;
+        impl std::fmt::Debug for DisplayOnlyError {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("error Debug must not be called");
+            }
+        }
+        impl std::fmt::Display for DisplayOnlyError {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("safe message")
+            }
+        }
+        impl Error for DisplayOnlyError {}
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_builder = Arc::clone(&calls);
+        let mut settings = RuntimeSettings::default();
+        settings.sentry_error_event_builder = Some(Arc::new(move |error| {
+            calls_for_builder.fetch_add(1, Ordering::SeqCst);
+            assert!(error.downcast_ref::<DisplayOnlyError>().is_some());
+            sentry_core::protocol::Event {
+                message: Some(error.to_string()),
+                level: sentry_core::Level::Error,
+                ..Default::default()
+            }
+        }));
+        let metadata = metadata("mailers", vec![job("job-123", 1, 3)]);
+        let events = sentry_core::test::with_captured_events(|| {
+            let ((), execution_hub) =
+                futures::executor::block_on(with_execution_sentry_hub(async {
+                    sentry_core::configure_scope(|scope| {
+                        scope.set_tag("worker.context", "preserved");
+                    });
+                    sentry_core::add_breadcrumb(sentry_core::Breadcrumb {
+                        message: Some("before failure".to_string()),
+                        ..Default::default()
+                    });
+                }));
+            settings.report_failure(
+                WorkerFailureReport {
+                    failure: WorkerFailure::Error(&DisplayOnlyError),
+                    metadata: &metadata,
+                },
+                &execution_hub,
+            );
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(events.len(), 1);
+        let event = item(&events, 0);
+        assert_eq!(event.message.as_deref(), Some("safe message"));
+        assert_eq!(tag(event, "worker.context"), "preserved");
+        assert_eq!(tag(event, "oxana.job_id"), "job-123");
+        assert_eq!(tag(event, "oxana.retry_count"), "1");
+        assert!(oxana_context(event).contains_key("jobs"));
+        assert_eq!(event.breadcrumbs.len(), 1);
+        assert_eq!(
+            item(event.breadcrumbs.as_ref(), 0).message.as_deref(),
+            Some("before failure")
+        );
+    }
+
+    #[cfg(feature = "sentry")]
+    #[test]
+    fn failure_reporter_takes_precedence_over_error_event_builder() {
+        let mut settings = RuntimeSettings::default();
+        settings.failure_reporter = Some(Arc::new(|_| {
+            sentry_core::capture_message("custom report", sentry_core::Level::Error);
+        }));
+        settings.sentry_error_event_builder =
+            Some(Arc::new(|_| panic!("builder must be bypassed")));
+        let metadata = metadata("custom", vec![job("job-123", 0, 1)]);
+        let events = sentry_core::test::with_captured_events(|| {
+            settings.report_failure(
+                WorkerFailureReport {
+                    failure: WorkerFailure::Error(&ConcreteWorkerError),
+                    metadata: &metadata,
+                },
+                &execution_sentry_hub(),
+            );
+        });
+        assert_eq!(events.len(), 1);
+        assert_eq!(item(&events, 0).message.as_deref(), Some("custom report"));
     }
 
     #[cfg(feature = "sentry")]
@@ -547,7 +647,7 @@ mod tests {
                 }));
 
             super::report_failure(
-                None,
+                &RuntimeSettings::default(),
                 WorkerFailureReport {
                     failure: WorkerFailure::Error(&error),
                     metadata: &metadata,
@@ -755,8 +855,11 @@ mod tests {
                         .catch_unwind(),
                     ));
                 assert!(result.is_err());
+                let mut settings = RuntimeSettings::default();
+                settings.sentry_error_event_builder =
+                    Some(Arc::new(|_| panic!("error builder must not handle panics")));
                 super::report_failure(
-                    None,
+                    &settings,
                     WorkerFailureReport {
                         failure: WorkerFailure::Panic {
                             message: "worker panicked",
@@ -827,8 +930,10 @@ mod tests {
                         AssertUnwindSafe(async { panic!("worker panicked") }).catch_unwind(),
                     ));
                 assert!(result.is_err());
+                let mut settings = RuntimeSettings::default();
+                settings.failure_reporter = Some(Arc::clone(&reporter));
                 super::report_failure(
-                    Some(&reporter),
+                    &settings,
                     WorkerFailureReport {
                         failure: WorkerFailure::Panic {
                             message: "worker panicked",

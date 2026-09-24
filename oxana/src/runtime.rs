@@ -202,6 +202,30 @@ where
         self
     }
 
+    /// Customizes Sentry events for returned worker errors.
+    ///
+    /// Defaults to [`sentry_core::event_from_error`]. The callback receives the
+    /// concrete error for downcasting and returns an event without capturing it.
+    /// Oxana retains the worker's execution scope and attaches job and retry
+    /// metadata before capturing the event once. Panic reporting is unchanged.
+    ///
+    /// This does not change stored error text; use [`Self::error_formatter`] for
+    /// that. A configured [`Self::failure_reporter`] takes precedence over this
+    /// callback and replaces all built-in reporting.
+    #[cfg(feature = "sentry")]
+    pub fn sentry_error_event_builder(
+        mut self,
+        builder: impl Fn(
+            &(dyn std::error::Error + Send + Sync + 'static),
+        ) -> sentry_core::protocol::Event<'static>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.settings.sentry_error_event_builder = Some(Arc::new(builder));
+        self
+    }
+
     /// Replaces Oxana's built-in worker failure reporting.
     ///
     /// The callback runs once per failed execution, including once for an

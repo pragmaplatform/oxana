@@ -17,6 +17,10 @@ pub(crate) type RetryDelayOverrideFn =
     dyn Fn(&(dyn std::error::Error + Send + Sync + 'static), u32, u64) -> Option<u64> + Send + Sync;
 pub(crate) type ErrorFormatterFn =
     dyn Fn(&(dyn std::error::Error + Send + Sync + 'static)) -> String + Send + Sync;
+#[cfg(feature = "sentry")]
+pub(crate) type SentryErrorEventBuilderFn = dyn Fn(&(dyn std::error::Error + Send + Sync + 'static)) -> sentry_core::protocol::Event<'static>
+    + Send
+    + Sync;
 
 type ShutdownSignal =
     Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send + Sync + 'static>>;
@@ -29,6 +33,8 @@ pub(crate) struct RuntimeSettings {
     pub(crate) retry_delay_override: Option<Arc<RetryDelayOverrideFn>>,
     pub(crate) error_formatter: Option<Arc<ErrorFormatterFn>>,
     pub(crate) failure_reporter: Option<Arc<FailureReporterFn>>,
+    #[cfg(feature = "sentry")]
+    pub(crate) sentry_error_event_builder: Option<Arc<SentryErrorEventBuilderFn>>,
     pub(crate) heartbeat_interval: Duration,
     pub(crate) dead_process_threshold: Duration,
     pub(crate) resurrect_scan_interval: Duration,
@@ -54,6 +60,8 @@ impl RuntimeSettings {
             retry_delay_override: None,
             error_formatter: None,
             failure_reporter: None,
+            #[cfg(feature = "sentry")]
+            sentry_error_event_builder: None,
             heartbeat_interval: Duration::from_millis(500),
             dead_process_threshold: DEFAULT_DEAD_PROCESS_THRESHOLD,
             resurrect_scan_interval: Duration::from_secs(2),
@@ -120,7 +128,7 @@ impl RuntimeSettings {
         report: WorkerFailureReport<'_>,
         execution_hub: &ExecutionSentryHub,
     ) {
-        report_failure(self.failure_reporter.as_ref(), report, execution_hub);
+        report_failure(self, report, execution_hub);
     }
 }
 
