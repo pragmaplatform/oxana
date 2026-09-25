@@ -266,14 +266,14 @@ let runtime = storage
     .error_formatter(|error| error.to_string());
 ```
 
-**Unreleased breaking change (planned for the next major release):** built-in worker panic
+**Breaking default behavior change in 2.3.0:** built-in worker panic
 reporting now requires the opt-in `sentry-panic` feature. Defaults include `sentry` but exclude `sentry-panic`. Panic catching,
 failure storage, retries, batch handling, worker survival, and custom `failure_reporter`
 callbacks remain enabled in every feature configuration.
 
 Keep `sentry` enabled and omit `sentry-panic` for returned-error reporting only.
-To restore 2.x built-in panic reporting, add `"sentry-panic"` to the Oxana dependency's
-`features` list after upgrading to the next major release.
+To restore built-in panic reporting from 2.2.0 and earlier, add `"sentry-panic"` to the Oxana dependency's
+`features` list after upgrading to 2.3.0.
 
 With the `sentry` feature enabled, returned worker errors are reported once by default with isolated
 `oxana.*` tags and an `oxana` context containing job IDs, queue/job/worker names, batch size, and
