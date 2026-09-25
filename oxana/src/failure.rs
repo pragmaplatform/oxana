@@ -2,7 +2,7 @@ use std::error::Error;
 use std::future::Future;
 #[cfg(any(feature = "sentry", test))]
 use std::sync::Arc;
-#[cfg(feature = "sentry")]
+#[cfg(feature = "sentry-panic")]
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -94,7 +94,7 @@ pub(crate) type FailureReporterFn = dyn for<'a> Fn(WorkerFailureReport<'a>) + Se
 pub(crate) struct ExecutionSentryHub {
     #[cfg(feature = "sentry")]
     hub: Arc<sentry_core::Hub>,
-    #[cfg(feature = "sentry")]
+    #[cfg(feature = "sentry-panic")]
     panic_event: Arc<Mutex<Option<sentry_core::protocol::Event<'static>>>>,
 }
 
@@ -102,16 +102,19 @@ pub(crate) fn execution_sentry_hub() -> ExecutionSentryHub {
     #[cfg(feature = "sentry")]
     {
         let hub = Arc::new(sentry_core::Hub::new_from_top(sentry_core::Hub::current()));
+        #[cfg(feature = "sentry-panic")]
         let panic_event = Arc::new(Mutex::new(None));
+        #[cfg(feature = "sentry-panic")]
         let panic_event_for_processor = Arc::clone(&panic_event);
         hub.configure_scope(|scope| {
             // Sentry's panic hook runs before Oxana's catch_unwind completes.
-            // Retain the first event emitted during that unwind. The panic
-            // integration runs before destructors, so this preserves its
-            // stacktrace while still delaying capture until after custom
-            // reporter selection.
+            // Suppress events during unwinding until reporter selection,
+            // including captures from destructors that could duplicate the
+            // panic hook event. Only retain that first hook event (and its
+            // stacktrace) when built-in panic reporting is enabled.
             scope.add_event_processor(move |event| {
                 if std::thread::panicking() {
+                    #[cfg(feature = "sentry-panic")]
                     if is_panic_integration_event(&event) {
                         let mut panic_event = panic_event_for_processor
                             .lock()
@@ -126,7 +129,11 @@ pub(crate) fn execution_sentry_hub() -> ExecutionSentryHub {
                 }
             });
         });
-        ExecutionSentryHub { hub, panic_event }
+        ExecutionSentryHub {
+            hub,
+            #[cfg(feature = "sentry-panic")]
+            panic_event,
+        }
     }
 
     #[cfg(not(feature = "sentry"))]
@@ -135,7 +142,7 @@ pub(crate) fn execution_sentry_hub() -> ExecutionSentryHub {
     }
 }
 
-#[cfg(feature = "sentry")]
+#[cfg(feature = "sentry-panic")]
 fn is_panic_integration_event(event: &sentry_core::protocol::Event<'_>) -> bool {
     event.exception.iter().any(|exception| {
         exception
@@ -145,7 +152,7 @@ fn is_panic_integration_event(event: &sentry_core::protocol::Event<'_>) -> bool 
     })
 }
 
-#[cfg(feature = "sentry")]
+#[cfg(feature = "sentry-panic")]
 impl ExecutionSentryHub {
     fn take_panic_event(&self) -> Option<sentry_core::protocol::Event<'static>> {
         self.panic_event
@@ -221,16 +228,22 @@ fn default_sentry_report(
                 hub.capture_event(event);
             });
         }),
+        #[cfg(feature = "sentry-panic")]
         WorkerFailure::Panic { message } => {
-            let event = execution_hub
-                .take_panic_event()
-                .map_or_else(|| fallback_panic_event(message), mark_panic_event_handled);
-            capture_panic_event(report, execution_hub, event);
+            if let Some(event) = execution_hub.take_panic_event() {
+                capture_panic_event(report, execution_hub, mark_panic_event_handled(event));
+            } else {
+                with_failure_sentry_scope(report, execution_hub, || {
+                    sentry_core::capture_event(fallback_panic_event(message));
+                });
+            }
         }
+        #[cfg(not(feature = "sentry-panic"))]
+        WorkerFailure::Panic { .. } => {}
     }
 }
 
-#[cfg(feature = "sentry")]
+#[cfg(feature = "sentry-panic")]
 fn mark_panic_event_handled(
     mut event: sentry_core::protocol::Event<'static>,
 ) -> sentry_core::protocol::Event<'static> {
@@ -245,7 +258,7 @@ fn mark_panic_event_handled(
     event
 }
 
-#[cfg(feature = "sentry")]
+#[cfg(feature = "sentry-panic")]
 fn fallback_panic_event(message: &str) -> sentry_core::protocol::Event<'static> {
     use sentry_core::protocol::{Event, Exception, Mechanism};
 
@@ -266,7 +279,7 @@ fn fallback_panic_event(message: &str) -> sentry_core::protocol::Event<'static> 
     }
 }
 
-#[cfg(feature = "sentry")]
+#[cfg(feature = "sentry-panic")]
 fn capture_panic_event(
     report: WorkerFailureReport<'_>,
     execution_hub: &ExecutionSentryHub,
@@ -352,7 +365,15 @@ mod tests {
         }
     }
 
-    impl Error for ConcreteWorkerError {}
+    impl Error for ConcreteWorkerError {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&RootCause)
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("root cause")]
+    struct RootCause;
 
     fn job(job_id: &str, retry_count: u32, max_retries: u32) -> FailedJobMetadata {
         let will_retry = retry_count < max_retries;
@@ -493,6 +514,20 @@ mod tests {
             assert!(error.downcast_ref::<DisplayOnlyError>().is_some());
             sentry_core::protocol::Event {
                 message: Some(error.to_string()),
+                exception: vec![sentry_core::protocol::Exception {
+                    ty: "ApplicationError".to_string(),
+                    stacktrace: Some(sentry_core::protocol::Stacktrace {
+                        frames: vec![sentry_core::protocol::Frame {
+                            function: Some("service::send_mail".to_string()),
+                            filename: Some("service.rs".to_string()),
+                            lineno: Some(42),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]
+                .into(),
                 level: sentry_core::Level::Error,
                 ..Default::default()
             }
@@ -521,6 +556,14 @@ mod tests {
         assert_eq!(events.len(), 1);
         let event = item(&events, 0);
         assert_eq!(event.message.as_deref(), Some("safe message"));
+        let stacktrace = item(event.exception.as_ref(), 0)
+            .stacktrace
+            .as_ref()
+            .expect("recorded application call chain");
+        let frame = item(&stacktrace.frames, 0);
+        assert_eq!(frame.function.as_deref(), Some("service::send_mail"));
+        assert_eq!(frame.filename.as_deref(), Some("service.rs"));
+        assert_eq!(frame.lineno, Some(42));
         assert_eq!(tag(event, "worker.context"), "preserved");
         assert_eq!(tag(event, "oxana.job_id"), "job-123");
         assert_eq!(tag(event, "oxana.retry_count"), "1");
@@ -609,6 +652,11 @@ mod tests {
             Some("error")
         );
 
+        assert_eq!(event.exception.len(), 2);
+        assert_eq!(
+            item(event.exception.as_ref(), 0).value.as_deref(),
+            Some("root cause")
+        );
         let context = oxana_context(event);
         assert_eq!(context.get("queue"), Some(&serde_json::json!("mailers")));
         assert_eq!(
@@ -831,157 +879,157 @@ mod tests {
 
     #[cfg(feature = "sentry")]
     #[test]
-    fn default_report_preserves_panic_integration_stacktrace() {
+    fn panic_reporting_respects_features_and_reporter_during_unwind() {
         use futures::FutureExt;
         use std::panic::AssertUnwindSafe;
 
-        let metadata = metadata("panics", vec![job("panic-id", 0, 0)]);
-        let options = sentry_core::ClientOptions::new()
-            .add_integration(sentry_panic::PanicIntegration::default());
+        // Destructors may emit both ordinary diagnostics and panic-like events
+        // during unwinding. Neither may bypass reporter selection or replace
+        // the original hook event and its stacktrace.
+        struct ReportOnDrop(bool);
+        impl Drop for ReportOnDrop {
+            fn drop(&mut self) {
+                sentry_core::capture_message("unwind diagnostic", sentry_core::Level::Error);
+                if !self.0 {
+                    return;
+                }
+                sentry_core::capture_event(sentry_core::protocol::Event {
+                    exception: vec![sentry_core::protocol::Exception {
+                        ty: "panic".to_string(),
+                        value: Some("duplicate from destructor".to_string()),
+                        mechanism: Some(sentry_core::protocol::Mechanism {
+                            ty: "panic".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }]
+                    .into(),
+                    ..Default::default()
+                });
+            }
+        }
+
+        for with_hook in [false, true] {
+            for custom_reporter in [false, true] {
+                for batch_size in [1, 2] {
+                    let metadata = metadata(
+                        "panics",
+                        (0..batch_size)
+                            .map(|i| job(&format!("panic-{i}"), i, 1))
+                            .collect(),
+                    );
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let mut settings = RuntimeSettings::default();
+                    settings.sentry_error_event_builder = Some(Arc::new(|_| {
+                        panic!("error builder must never handle panics");
+                    }));
+                    if custom_reporter {
+                        let calls = Arc::clone(&calls);
+                        settings.failure_reporter = Some(Arc::new(move |report| {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            assert!(matches!(
+                                report.failure,
+                                WorkerFailure::Panic {
+                                    message: "worker panicked"
+                                }
+                            ));
+                            assert_eq!(report.metadata.batch_size, batch_size as usize);
+                            sentry_core::capture_message("custom panic", sentry_core::Level::Error);
+                        }));
+                    }
+                    let mut options = sentry_core::ClientOptions::new();
+                    if with_hook {
+                        options =
+                            options.add_integration(sentry_panic::PanicIntegration::default());
+                    }
+                    let events = sentry_core::test::with_captured_events_options(
+                        || {
+                            let (result, execution_hub) =
+                                futures::executor::block_on(with_execution_sentry_hub(
+                                    AssertUnwindSafe(async {
+                                        sentry_core::configure_scope(|scope| {
+                                            scope.set_tag("worker.context", "preserved");
+                                        });
+                                        sentry_core::add_breadcrumb(sentry_core::Breadcrumb {
+                                            message: Some("before panic".to_string()),
+                                            ..Default::default()
+                                        });
+                                        let _report_on_drop = ReportOnDrop(with_hook);
+                                        panic!("worker panicked");
+                                    })
+                                    .catch_unwind(),
+                                ));
+                            assert!(result.is_err());
+                            super::report_failure(
+                                &settings,
+                                WorkerFailureReport {
+                                    failure: WorkerFailure::Panic {
+                                        message: "worker panicked",
+                                    },
+                                    metadata: &metadata,
+                                },
+                                &execution_hub,
+                            );
+                        },
+                        options,
+                    );
+                    assert_eq!(calls.load(Ordering::SeqCst), usize::from(custom_reporter));
+                    let expected = usize::from(custom_reporter || cfg!(feature = "sentry-panic"));
+                    assert_eq!(
+                        events.len(),
+                        expected,
+                        "hook={with_hook}, custom={custom_reporter}, batch={batch_size}"
+                    );
+                    if custom_reporter {
+                        assert_eq!(item(&events, 0).message.as_deref(), Some("custom panic"));
+                    } else if cfg!(feature = "sentry-panic") {
+                        let event = item(&events, 0);
+                        let exception = item(event.exception.as_ref(), 0);
+                        assert_eq!(exception.value.as_deref(), Some("worker panicked"));
+                        let mechanism = exception.mechanism.as_ref().expect("panic mechanism");
+                        assert_eq!(mechanism.ty, "oxana.worker_panic");
+                        assert_eq!(mechanism.handled, Some(true));
+                        if with_hook {
+                            assert!(
+                                !exception
+                                    .stacktrace
+                                    .as_ref()
+                                    .expect("hook stacktrace")
+                                    .frames
+                                    .is_empty()
+                            );
+                        }
+                        assert_eq!(tag(event, "worker.context"), "preserved");
+                        assert_eq!(tag(event, "oxana.failure_kind"), "panic");
+                        assert_eq!(tag(event, "oxana.batch_size"), batch_size.to_string());
+                        assert_eq!(
+                            oxana_context(event).get("jobs"),
+                            Some(&serde_json::to_value(&metadata.jobs).expect("jobs"))
+                        );
+                        assert_eq!(event.breadcrumbs.len(), 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "sentry")]
+    #[test]
+    fn panic_hook_outside_worker_scope_is_unaffected() {
         let events = sentry_core::test::with_captured_events_options(
             || {
-                let (result, execution_hub) =
-                    futures::executor::block_on(with_execution_sentry_hub(
-                        AssertUnwindSafe(async {
-                            sentry_core::configure_scope(|scope| {
-                                scope.set_tag("worker.context", "preserved");
-                            });
-                            sentry_core::add_breadcrumb(sentry_core::Breadcrumb {
-                                message: Some("before panic".to_string()),
-                                ..Default::default()
-                            });
-                            panic!("worker panicked");
-                        })
-                        .catch_unwind(),
-                    ));
-                assert!(result.is_err());
-                let mut settings = RuntimeSettings::default();
-                settings.sentry_error_event_builder =
-                    Some(Arc::new(|_| panic!("error builder must not handle panics")));
-                super::report_failure(
-                    &settings,
-                    WorkerFailureReport {
-                        failure: WorkerFailure::Panic {
-                            message: "worker panicked",
-                        },
-                        metadata: &metadata,
-                    },
-                    &execution_hub,
-                );
+                futures::executor::block_on(with_execution_sentry_hub(async {}));
+                assert!(std::panic::catch_unwind(|| panic!("application panic")).is_err());
             },
-            options,
+            sentry_core::ClientOptions::new()
+                .add_integration(sentry_panic::PanicIntegration::default()),
         );
-
         assert_eq!(events.len(), 1);
-        let event = item(&events, 0);
-        let exception = item(event.exception.as_ref(), 0);
-        let stacktrace = exception
-            .stacktrace
+        let mechanism = item(item(&events, 0).exception.as_ref(), 0)
+            .mechanism
             .as_ref()
-            .expect("panic integration stacktrace");
-        assert!(!stacktrace.frames.is_empty());
-        assert_eq!(
-            exception
-                .mechanism
-                .as_ref()
-                .and_then(|mechanism| mechanism.handled),
-            Some(true)
-        );
-        assert_eq!(
-            exception
-                .mechanism
-                .as_ref()
-                .map(|mechanism| mechanism.ty.as_str()),
-            Some("oxana.worker_panic")
-        );
-        assert_eq!(tag(event, "worker.context"), "preserved");
-        assert_eq!(tag(event, "oxana.job_id"), "panic-id");
-        assert_eq!(tag(event, "oxana.terminal"), "true");
-        assert_eq!(
-            event
-                .breadcrumbs
-                .iter()
-                .filter(|breadcrumb| breadcrumb.message.as_deref() == Some("before panic"))
-                .count(),
-            1,
-            "worker breadcrumbs must not be duplicated when the event is recaptured"
-        );
-    }
-
-    #[cfg(feature = "sentry")]
-    #[test]
-    fn panic_integration_waits_for_custom_reporter_before_capture() {
-        use futures::FutureExt;
-        use std::panic::AssertUnwindSafe;
-
-        let metadata = metadata("panics", vec![job("panic-id", 0, 0)]);
-        let reporter: Arc<FailureReporterFn> = Arc::new(|report| {
-            assert!(matches!(report.failure, WorkerFailure::Panic { .. }));
-            let reported_job = item(&report.metadata.jobs, 0);
-            assert_eq!(json_field(&reported_job.args, "source"), "panic-id");
-            sentry_core::capture_message("redacted panic", sentry_core::Level::Error);
-        });
-        let options = sentry_core::ClientOptions::new()
-            .add_integration(sentry_panic::PanicIntegration::default());
-        let events = sentry_core::test::with_captured_events_options(
-            || {
-                let (result, execution_hub) =
-                    futures::executor::block_on(with_execution_sentry_hub(
-                        AssertUnwindSafe(async { panic!("worker panicked") }).catch_unwind(),
-                    ));
-                assert!(result.is_err());
-                let mut settings = RuntimeSettings::default();
-                settings.failure_reporter = Some(Arc::clone(&reporter));
-                super::report_failure(
-                    &settings,
-                    WorkerFailureReport {
-                        failure: WorkerFailure::Panic {
-                            message: "worker panicked",
-                        },
-                        metadata: &metadata,
-                    },
-                    &execution_hub,
-                );
-            },
-            options,
-        );
-
-        assert_eq!(events.len(), 1);
-        let event = item(&events, 0);
-        assert_eq!(event.message.as_deref(), Some("redacted panic"));
-        assert!(event.exception.is_empty());
-        assert!(!event.contexts.contains_key("oxana"));
-    }
-
-    #[cfg(feature = "sentry")]
-    #[test]
-    fn panic_without_panic_integration_is_reported_once_by_oxana() {
-        let metadata = metadata("panics", vec![job("panic-id", 0, 0)]);
-        let events = sentry_core::test::with_captured_events(|| {
-            report_failure(
-                None,
-                WorkerFailureReport {
-                    failure: WorkerFailure::Panic {
-                        message: "worker panicked",
-                    },
-                    metadata: &metadata,
-                },
-            );
-        });
-
-        assert_eq!(events.len(), 1);
-        let event = item(&events, 0);
-        let exception = item(event.exception.as_ref(), 0);
-        assert!(event.message.is_none());
-        assert_eq!(exception.ty, "panic");
-        assert_eq!(exception.value.as_deref(), Some("worker panicked"));
-        assert_eq!(
-            exception
-                .mechanism
-                .as_ref()
-                .and_then(|mechanism| mechanism.handled),
-            Some(true)
-        );
-        assert_eq!(tag(event, "oxana.failure_kind"), "panic");
+            .expect("application mechanism");
+        assert_eq!(mechanism.ty, "panic");
+        assert_eq!(mechanism.handled, Some(false));
     }
 }
