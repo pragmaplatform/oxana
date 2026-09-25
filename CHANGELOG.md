@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- Built-in worker panic telemetry now requires the opt-in `sentry-panic = ["sentry"]` feature, outside the default feature set. Ordinary `sentry` reports returned errors only and suppresses worker panic-hook events. Add `sentry-panic` to restore 2.x reporting. This default behavior change is reserved for the next major release (versions are not bumped yet); do not backport it to 2.x.
+- Panic catching, failure storage, retries, batch handling, worker survival, and custom `failure_reporter` callbacks are unchanged. Applications still own their global Sentry panic hook; Oxana installs no hook. Custom reporters retain precedence in every configuration.
+
+### Fixed
+
+- Preserve worker scope and breadcrumbs in fallback panic events when `sentry-panic` is enabled without an application-installed hook.
+
+### Migration
+
+- Update FirstLook separately after publication: retain regular `sentry`, omit `sentry-panic`, update its lockfile, remove `discard_panic_events` and its filter test, keep the application's Sentry `panic` feature disabled, and preserve its service-error event builder. Audit additive Cargo features across Oxana, the dashboard, and MCP. Oxana now covers panic-event suppression in its feature-matrix tests.
+
 ## [2.2.0] - 2026-09-24
 
 ### Added

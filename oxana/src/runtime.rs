@@ -207,7 +207,9 @@ where
     /// Defaults to [`sentry_core::event_from_error`]. The callback receives the
     /// concrete error for downcasting and returns an event without capturing it.
     /// Oxana retains the worker's execution scope and attaches job and retry
-    /// metadata before capturing the event once. Panic reporting is unchanged.
+    /// metadata before capturing the event once. Panic reporting is controlled
+    /// separately by the opt-in `sentry-panic` feature; this builder never runs
+    /// for panics.
     ///
     /// This does not change stored error text; use [`Self::error_formatter`] for
     /// that. A configured [`Self::failure_reporter`] takes precedence over this
@@ -247,11 +249,12 @@ where
     /// available and runs without any Sentry dependency.
     ///
     /// Sentry's panic integration observes a panic before Oxana catches it.
-    /// Oxana intercepts that event on the isolated worker hub. The built-in
-    /// reporter enriches and submits it after the panic is caught, preserving
-    /// its stacktrace. A custom reporter replaces and discards the intercepted
-    /// event. This prevents both duplicate events and argument capture before
-    /// a custom reporter can redact the metadata.
+    /// With `sentry`, Oxana suppresses that event on the isolated worker hub.
+    /// The opt-in `sentry-panic` feature retains it for built-in reporting after
+    /// the catch, preserving its stacktrace. A custom reporter always replaces
+    /// built-in reporting and discards any retained event. The callback still
+    /// receives panic failures without either feature. Oxana installs no global
+    /// panic hook, and feature selection does not affect panic recovery or retries.
     pub fn failure_reporter(
         mut self,
         reporter: impl for<'a> Fn(WorkerFailureReport<'a>) + Send + Sync + 'static,

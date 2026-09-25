@@ -16,6 +16,7 @@ test = true
 [features]
 default = ["sentry", "tracing-instrument", "macros"]
 sentry = ["sentry-core/client"]
+sentry-panic = ["sentry"]
 tracing-instrument = []
 macros = ["oxana-macros"]
 registry = ["inventory", "oxana-macros?/registry"]

@@ -266,10 +266,19 @@ let runtime = storage
     .error_formatter(|error| error.to_string());
 ```
 
-With the `sentry` feature enabled, failed executions are reported once by default with isolated
+**Unreleased breaking change (planned for the next major release):** built-in worker panic
+reporting now requires the opt-in `sentry-panic` feature. Defaults include `sentry` but exclude `sentry-panic`. Panic catching,
+failure storage, retries, batch handling, worker survival, and custom `failure_reporter`
+callbacks remain enabled in every feature configuration.
+
+Keep `sentry` enabled and omit `sentry-panic` for returned-error reporting only.
+To restore 2.x built-in panic reporting, add `"sentry-panic"` to the Oxana dependency's
+`features` list after upgrading to the next major release.
+
+With the `sentry` feature enabled, returned worker errors are reported once by default with isolated
 `oxana.*` tags and an `oxana` context containing job IDs, queue/job/worker names, batch size, and
 per-job arguments and retry state. To customize events for returned errors while retaining this
-metadata, worker scope, and built-in panic reporting, use `sentry_error_event_builder`:
+metadata and worker scope, use `sentry_error_event_builder`:
 
 ```rust
 let runtime = storage.runtime(ctx).sentry_error_event_builder(|error| {
@@ -286,7 +295,7 @@ backtrace resolution should build events from safe messages and recorded locatio
 safe `Debug` output or an `error_formatter` for the dashboard. The event builder runs only for
 returned errors when a Sentry client is active.
 
-Applications that need to replace all reporting, including panic handling, can instead use
+Applications that need to replace all reporting, including panic reporting, can instead use
 `failure_reporter`. It takes precedence over `sentry_error_event_builder`:
 
 ```rust
@@ -305,11 +314,21 @@ let runtime = storage.runtime(ctx).failure_reporter(|report| {
 });
 ```
 
-The callback is also available without the `sentry` feature. Sentry's panic integration runs before
-Oxana catches a worker panic, so Oxana intercepts its event on the isolated worker hub. The built-in
-reporter enriches and submits that event after the catch, preserving its stacktrace. A custom
-reporter replaces and discards the intercepted event. This prevents both a duplicate event and
-argument capture before custom redaction can run.
+The callback receives panic failures exactly once per execution (including an entire failed
+batch), regardless of Sentry features. `sentry_error_event_builder` never runs for panics.
+
+Applications own their global Sentry panic hook. Oxana neither installs one nor enables the
+application's Sentry panic integration. With `sentry`, Oxana suppresses automatic hook events
+and other events emitted during unwinding on its isolated worker hub. Without `sentry-panic`,
+these events are discarded without retaining a panic-event buffer. With `sentry-panic`, Oxana
+retains the first hook event and reports it after the catch, preserving its stacktrace and
+breadcrumbs and attaching job/retry metadata with the handled `oxana.worker_panic` mechanism.
+If there is no hook event, Oxana builds a fallback event. A custom reporter always replaces
+built-in reporting and discards any retained event. Panics outside the worker scope are unaffected.
+
+Cargo features are additive: check `cargo tree -e features -i oxana` in the application to ensure
+no dependency enables `oxana/sentry-panic`. `oxana-web` and `oxana-mcp` use Oxana's defaults,
+which do not enable panic reporting.
 
 Serialized job arguments are included in failure metadata and default Sentry events. Arguments can
 contain sensitive application data; custom reporters receive the metadata without Oxana attaching

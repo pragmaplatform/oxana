@@ -38,11 +38,27 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+      - name: Feature dependencies
+        run: |
+          cargo tree -p oxana --no-default-features -e normal > core-dependencies.txt
+          if grep -q sentry core-dependencies.txt; then exit 1; fi
+          cargo tree -p oxana -p oxana-web -p oxana-mcp -e features,no-dev > workspace-features.txt
+          if grep -q 'oxana feature "sentry-panic"' workspace-features.txt; then exit 1; fi
+
       - name: Test
         run: |
-          cargo test --lib --no-default-features
+          cargo check -p oxana --no-default-features
+          cargo test -p oxana --lib --test panic_reporting --no-default-features
+          cargo check -p oxana --no-default-features --features sentry
+          cargo test -p oxana --lib --test panic_reporting --no-default-features --features sentry
+          cargo check -p oxana --no-default-features --features sentry-panic
+          cargo test -p oxana --lib --test panic_reporting --no-default-features --features sentry-panic
+          cargo check -p oxana --no-default-features --features sentry,sentry-panic
+          cargo test -p oxana --lib --test panic_reporting --no-default-features --features sentry,sentry-panic
+          cargo test -p oxana --lib --test panic_reporting
+          cargo check --workspace --all-features
           cargo test -p oxana-mcp --all-targets
-          cargo nextest run --all-features --no-fail-fast
+          cargo nextest run --workspace --all-features --no-fail-fast
 
       - name: Lint
         run: cargo clippy --all-features --workspace --all-targets -- -D warnings
