@@ -4,9 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-09-25
+
 ### Breaking changes
 
-- Built-in worker panic telemetry now requires the opt-in `sentry-panic = ["sentry"]` feature, outside the default feature set. Ordinary `sentry` reports returned errors only and suppresses worker panic-hook events. Add `sentry-panic` to restore 2.x reporting. This default behavior change is reserved for the next major release (versions are not bumped yet); do not backport it to 2.x.
+- Built-in worker panic telemetry now requires the opt-in `sentry-panic = ["sentry"]` feature, outside the default feature set. Ordinary `sentry` reports returned errors only and suppresses worker panic-hook events. Add `sentry-panic` to restore the reporting behavior from 2.2.0 and earlier. This default behavior change ships in the 2.3.0 minor release.
 - Panic catching, failure storage, retries, batch handling, worker survival, and custom `failure_reporter` callbacks are unchanged. Applications still own their global Sentry panic hook; Oxana installs no hook. Custom reporters retain precedence in every configuration.
 
 ### Fixed
