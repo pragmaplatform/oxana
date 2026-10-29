@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-10-29
+
 ### Added
 
 - Add `StorageBuilder::claimed_connection_retries` and `PoolRetryConfig` to override the claimed-job acquisition window and backoff, or disable acquisition retries. Defaults retain the timeout-derived budget and 100 ms to one-second backoff. Heartbeats and ordinary pool access are unaffected.
