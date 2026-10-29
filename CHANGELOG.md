@@ -8,6 +8,11 @@ All notable changes to this project will be documented in this file.
 
 - Add `StorageBuilder::claimed_connection_retries` and `PoolRetryConfig` to override the claimed-job acquisition window and backoff, or disable acquisition retries. Defaults retain the timeout-derived budget and 100 ms to one-second backoff. Heartbeats and ordinary pool access are unaffected.
 
+### Changed
+
+- Update workspace dependencies to their latest stable releases, including Syn 3, Darling 0.24, Sentry 0.49.5, rmcp 3.8, Tokio 1.54, and UUID 1.29.
+- Require Rust 1.89 or newer across all workspace crates for compatibility with the updated dependencies.
+
 ### Fixed
 
 - Bound claimed-job connection acquisition from the first attempt, including pools with unset timeouts. The configured or derived retry window now limits the entire checkout rather than starting after the first failure.

@@ -2,6 +2,7 @@
 name = "oxana-web"
 version = "2.4.1"
 edition = "2024"
+rust-version.workspace = true
 license = "MIT"
 description = "Web UI for Oxana job queue system."
 repository = "https://github.com/pragmaplatform/oxana"
@@ -23,7 +24,7 @@ chrono = { version = "^0.4", features = ["serde"] }
 serde = { version = "^1.0", features = ["derive"] }
 serde_json = { version = "^1.0", features = ["preserve_order"] }
 urlencoding = "2"
-uuid = { version = "^1.23", features = ["v4"] }
+uuid = { version = "^1.29", features = ["v4"] }
 
 [dev-dependencies]
 async-trait = "0.1"
@@ -32,5 +33,5 @@ oxana = { path = "../oxana", default-features = false, features = [
 ] }
 serde = { version = "^1.0", features = ["derive"] }
 thiserror = "^2.0"
-tokio = { version = "^1.52", features = ["full"] }
+tokio = { version = "^1.54", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }

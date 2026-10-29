@@ -4,7 +4,7 @@ resolver = "3"
 default-members = ["oxana"]
 
 [workspace.package]
-rust-version = "1.75"
+rust-version = "1.89"
 
 [workspace.dependencies]
 oxana = { version = "2.4.1", path = "oxana" }
