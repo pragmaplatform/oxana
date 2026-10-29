@@ -22,7 +22,7 @@ Use it to enqueue typed jobs, run workers with shared application state, and mon
 - **Unique jobs**: deduplicate by job ID, with skip or replace policies.
 - **Resumable jobs**: persist application checkpoints and progress between attempts.
 - **Batch processing**: collect jobs by batch size and timeout.
-- **Monitoring**: an Axum web dashboard, Prometheus metrics, optional Sentry reporting, and a separate read-only MCP server.
+- **Monitoring**: an Axum web dashboard, Prometheus metrics, Sentry error reporting (enabled by default), and a separate read-only MCP server.
 
 [Quick start](#quick-start) · [Core concepts](#core-concepts) · [Monitoring](#web-dashboard) · [Comparison](#comparison-with-similar-libraries) · [API docs](https://docs.rs/oxana/latest/oxana/) · [Examples](https://github.com/pragmaplatform/oxana/tree/main/oxana/examples)
 
@@ -97,7 +97,7 @@ Examples: [scheduling](https://github.com/pragmaplatform/oxana/blob/main/oxana/e
 
 ## Web Dashboard
 
-The separate `oxana-web` crate provides a dashboard for jobs, queues, worker metrics, and cron schedules. Add `oxana-web` to your Axum application and nest its router:
+The separate `oxana-web` crate provides a dashboard for jobs, queues, worker metrics, and cron schedules, with no separate JavaScript build step. Add `oxana-web` to your Axum application and nest its router:
 
 ```rust
 use oxana_web::OxanaWebState;
@@ -116,7 +116,12 @@ let oxana_router = oxana_web::router(OxanaWebState::new(
 let app = your_app_router().nest("/oxana", oxana_router);
 ```
 
-The dashboard shows active jobs, queues, worker metrics, cron schedules, scheduled jobs, retries, and dead jobs. It also supports manual enqueueing of jobs marked `#[oxana(on_demand)]`, queue pause/resume, dynamic concurrency changes, retrying failed jobs, and deleting jobs or clearing queues.
+The dashboard shows active jobs, queues, worker metrics, cron schedules, scheduled jobs, retries, and dead jobs. Management actions include:
+
+- Manually trigger cron jobs or enqueue jobs marked `#[oxana(on_demand)]`.
+- Pause and resume queues, or change dynamic queue concurrency.
+- Retry all pending retries immediately or revive all dead jobs.
+- Delete individual jobs or clear queues.
 
 Routes below are relative to the mount path (`/oxana` in the example):
 
@@ -228,7 +233,9 @@ shutdown after a persistent acquisition failure. Execution remains at least once
 
 ### Context
 
-Application context and job context have separate roles. Pass shared application resources, such as database pools and configuration, to `storage.runtime(app_context)`. Worker fields are populated from that context through `FromContext` or the worker derive.
+Application context and job context have separate roles. Pass shared application resources, such as database pools and configuration, to `storage.runtime(app_context)`.
+
+The `Worker` derive supports unit or empty workers, and workers with exactly one named field of the context type, which receives a clone of the context. For other layouts, implement `Worker<Args>` and `FromContext<C>` manually instead of using the derive.
 
 Each execution also receives a `JobContext` with job metadata and persistent state.
 
@@ -300,11 +307,13 @@ for excluded queues are not scheduled.
 
 #### Shutdown
 
-The default shutdown listener handles SIGTERM/SIGINT on Unix and Ctrl+C on Windows. Shutdown stops fetching new work and lets workers drain, with a shared 180-second deadline. Use `.shutdown_timeout(duration)` to change it or `.disable_shutdown_timeout()` to wait indefinitely. At the deadline, unfinished asynchronous tasks are cancelled and interrupted jobs remain eligible for recovery unless resurrection is disabled for their job type.
+The default shutdown listener handles SIGTERM/SIGINT on Unix and Ctrl+C on Windows. Shutdown stops fetching new work and lets workers drain. A shared 180-second deadline covers workers, background tasks, and process deregistration. Use `.shutdown_timeout(duration)` to change it or `.disable_shutdown_timeout()` to wait indefinitely.
+
+At the deadline, unfinished asynchronous tasks are cancelled and interrupted jobs remain eligible for recovery unless resurrection is disabled for their job type. `run()` returns `OxanaError::ShutdownTimeout` after an ordinary shutdown signal, or preserves the initiating error if a runtime failure triggered shutdown.
 
 ### Error and Panic Reporting
 
-Library operations return `OxanaError`. Workers can use their own error type with `#[oxana(error = MyError)]`.
+Library operations return `OxanaError`. Set a worker's associated error type with `#[oxana(error = MyError)]`; otherwise the derive uses `oxana::BoxError`. Custom error types must satisfy `IntoWorkerError + Send + Sync + 'static`; types implementing `std::error::Error + Send + Sync + 'static` meet that requirement automatically.
 
 Worker errors use their `Debug` representation by default so error types that capture backtraces
 can include them in the dashboard. Applications can override the stored representation when needed:
@@ -392,7 +401,7 @@ let output = metrics.encode_to_string()?;
 
 ## Comparison with Similar Libraries
 
-These libraries share retries and scheduling, but differ in storage, worker APIs, and integrations. The comparison below reflects the linked project documentation checked on 2026-10-29; backend and feature choices can affect availability.
+These libraries differ in storage, worker APIs, and integrations. The comparison below reflects the linked project documentation checked on 2026-10-29; backend and feature choices can affect availability.
 
 | Library | Storage | Worker model and documented capabilities |
 | --- | --- | --- |
