@@ -6,7 +6,7 @@ and Streamable HTTP at `/mcp`.
 
 ## Run the example
 
-Requires Rust 1.88 or newer and a running Redis instance containing Oxana data.
+Requires Rust 1.89 or newer and a running Redis instance containing Oxana data.
 Use the same Redis URLs and namespace as your workers.
 
 ```sh

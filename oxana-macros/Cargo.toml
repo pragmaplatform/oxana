@@ -2,6 +2,7 @@
 name = "oxana-macros"
 version = "2.4.1"
 edition = "2024"
+rust-version.workspace = true
 license = "MIT"
 description = "Macros for Oxana."
 repository = "https://github.com/pragmaplatform/oxana"
@@ -10,12 +11,12 @@ repository = "https://github.com/pragmaplatform/oxana"
 proc-macro = true
 
 [dependencies]
-darling = "0.23"
+darling = "0.24"
 heck = { version = "0.5", default-features = false }
 proc-macro-error2 = "2.0"
 proc-macro2 = "1.0"
 quote = "1.0"
-syn = { version = "2", features = ["parsing", "proc-macro", "derive"] }
+syn = { version = "3", features = ["parsing", "proc-macro", "derive"] }
 
 [features]
 default = []
