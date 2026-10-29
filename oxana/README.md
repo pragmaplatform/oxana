@@ -2,11 +2,11 @@
 
 [![Build Status](https://img.shields.io/github/actions/workflow/status/pragmaplatform/oxana/test.yml?branch=main)](https://github.com/pragmaplatform/oxana/actions)
 [![Latest Version](https://img.shields.io/crates/v/oxana.svg)](https://crates.io/crates/oxana)
-[![docs.rs](https://img.shields.io/static/v1?label=docs.rs&message=oxana&color=blue&logo=data:image/svg+xml;base64,PHN2ZyByb2xlPSJpbWciIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgdmlld0JveD0iMCAwIDUxMiA1MTIiPjxwYXRoIGZpbGw9IiNmNWY1ZjUiIGQ9Ik00ODguNiAyNTAuMkwzOTIgMjE0VjEwNS41YzAtMTUtOS4zLTI4LjQtMjMuNC0zMy43bC0xMDAtMzcuNWMtOC4xLTMuMS0xNy4xLTMuMS0yNS4zIDBsLTEwMCAzNy41Yy0xNC4xIDUuMy0yMy40IDE4LjctMjMuNCAzMy43VjIxNGwtOTYuNiAzNi4yQzkuMyAyNTUuNSAwIDI2OC45IDAgMjgzLjlWMzk0YzAgMTMuNiA3LjcgMjYuMSAxOS45IDMyLjJsMTAwIDUwYzEwLjEgNS4xIDIyLjEgNS4xIDMyLjIgMGwxMDMuOS01MiAxMDMuOSA1MmMxMC4xIDUuMSAyMi4xIDUuMSAzMi4yIDBsMTAwLTUwYzEyLjItNi4xIDE5LjktMTguNiAxOS45LTMyLjJWMjgzLjljMC0xNS05LjMtMjguNC0yMy40LTMzLjd6TTM1OCAyMTQuOGwtODUgMzEuOXYtNjguMmw4NS0zN3Y3My4zek0xNTQgMTA0LjFsMTAyLTM4LjIgMTAyIDM4LjJ2LjZsLTEwMiA0MS40LTEwMi00MS40di0uNnptODQgMjkxLjFsLTg1IDQyLjV2LTc5LjFsODUtMzguOHY3NS40em0wLTExMmwtMTAyIDQxLjQtMTAyLTQxLjR2LS42bDEwMi0zOC4yIDEwMiAzOC4ydi42em0yNDAgMTEybC04NSA0Mi41di03OS4xbDg1LTM4Ljh2NzUuNHptMC0xMTJsLTEwMiA0MS40LTEwMi00MS40di0uNmwxMDItMzguMiAxMDIgMzguMnYuNnoiPjwvcGF0aD48L3N2Zz4K)](https://docs.rs/oxana/latest)
+[![docs.rs](https://img.shields.io/docsrs/oxana)](https://docs.rs/oxana/latest)
 
 Oxana is a Redis-backed job processing library for Rust. It powers the background job infrastructure behind [Player.gg](https://player.gg) and [Firstlook.gg](https://firstlook.gg), serving hundreds of studios and millions of players.
 
-Oxana focuses on simplicity and depth over breadth - one backend, done well.
+Use it to enqueue typed jobs, run workers with shared application state, and monitor queues through a Rust web dashboard. Jobs can be retried or recovered after a worker stops, so handlers should tolerate repeated execution.
 
 <p align="center">
   <picture>
@@ -16,32 +16,34 @@ Oxana focuses on simplicity and depth over breadth - one backend, done well.
 
 ## Key Features
 
-- **Isolated Queues** - separate queues with independent concurrency and configuration
-- **Retries** - automatic retry with configurable backoff
-- **Scheduled Jobs** - run jobs at specific times or after delays
-- **Cron Jobs** - periodic jobs using cron expressions
-- **Batch Processing** - process jobs together with size and timeout based batching
-- **Dynamic Queues** - create and manage queues at runtime
-- **Runtime Queue Controls** - pause queues and adjust dynamic concurrency without restarting workers
-- **Throttling** - rate-limit job processing per queue
-- **Unique Jobs** - deduplicate jobs so only one instance runs at a time
-- **Resumable Jobs** - resume from where a job left off on retry
-- **Resilient Jobs** - survive worker crashes and restarts
-- **Graceful Shutdown** - clean shutdown with in-progress job handling
-- **Web Dashboard** - built-in UI for monitoring jobs, queues, metrics, and cron - pure Rust, no JS toolchain
-- **Prometheus Metrics** - export queue and job metrics for monitoring
-- **MCP Server** - bearer-authenticated, read-only monitoring for coding agents via the separate [`oxana-mcp`](https://github.com/pragmaplatform/oxana/tree/main/oxana-mcp) crate
-- **Well Tested** - comprehensive integration test suite
+- **Queue controls**: static and dynamic queues with independent concurrency, pause/resume, and rate limits.
+- **Scheduling**: immediate, delayed, scheduled, and cron jobs.
+- **Retries and recovery**: configurable retry backoff, dead jobs, crash recovery, and graceful shutdown.
+- **Unique jobs**: deduplicate by job ID, with skip or replace policies.
+- **Resumable jobs**: persist application checkpoints and progress between attempts.
+- **Batch processing**: collect jobs by batch size and timeout.
+- **Monitoring**: an Axum web dashboard, Prometheus metrics, Sentry error reporting (enabled by default), and a separate read-only MCP server.
+
+[Quick start](#quick-start) · [Core concepts](#core-concepts) · [Monitoring](#web-dashboard) · [Comparison](#comparison-with-similar-libraries) · [API docs](https://docs.rs/oxana/latest/oxana/) · [Examples](https://github.com/pragmaplatform/oxana/tree/main/oxana/examples)
 
 ## Quick Start
 
-Requires Rust 1.89 or newer.
+Requires Rust 1.89 or newer and a running Redis instance. In a new Rust binary project, add the dependencies used below:
 
 ```bash
 cargo add oxana@2.5.0 --features registry
+cargo add serde --features derive
+cargo add tokio --features macros,rt-multi-thread
+cargo add async-trait thiserror
 ```
 
-The `registry` feature (not enabled by default) powers `#[derive(oxana::Registry)]` and `runtime.register::<...>()` used below; without it, register queues and workers explicitly with `runtime.queue::<...>()` and `runtime.worker::<...>()`.
+Set the Redis connection URL:
+
+```bash
+export REDIS_URL=redis://127.0.0.1:6379
+```
+
+The opt-in `registry` feature discovers the queues and workers below. Put this code in `src/main.rs`:
 
 ```rust
 use oxana::Storage;
@@ -62,7 +64,7 @@ struct MyJob {
 }
 
 #[derive(oxana::Worker)]
-#[oxana(context = MyContext)]
+#[oxana(context = MyContext, error = MyError)]
 struct MyWorker;
 
 impl MyWorker {
@@ -89,11 +91,13 @@ async fn main() -> Result<(), oxana::OxanaError> {
 }
 ```
 
-For more detailed usage examples, check out the [examples directory](https://github.com/pragmaplatform/oxana/tree/main/oxana/examples).
+Run `cargo run` to enqueue and process the job. The runtime keeps listening for more work until shutdown: SIGINT or SIGTERM on Unix, or Ctrl+C on Windows.
+
+Examples: [scheduling](https://github.com/pragmaplatform/oxana/blob/main/oxana/examples/scheduled.rs), [cron](https://github.com/pragmaplatform/oxana/blob/main/oxana/examples/cron.rs), [unique jobs](https://github.com/pragmaplatform/oxana/blob/main/oxana/examples/unique.rs), [dynamic queues](https://github.com/pragmaplatform/oxana/blob/main/oxana/examples/dynamic.rs), [throttling](https://github.com/pragmaplatform/oxana/blob/main/oxana/examples/throttled.rs), [batches](https://github.com/pragmaplatform/oxana/blob/main/oxana/examples/batch.rs), and [resumable jobs](https://github.com/pragmaplatform/oxana/blob/main/oxana/examples/resumable.rs).
 
 ## Web Dashboard
 
-The `oxana-web` crate provides a built-in dashboard for monitoring jobs, queues, worker metrics, and cron schedules. It integrates as a nested axum router.
+The separate `oxana-web` crate provides a dashboard for jobs, queues, worker metrics, and cron schedules, with no separate JavaScript build step. Add `oxana-web` to your Axum application and nest its router:
 
 ```rust
 use oxana_web::OxanaWebState;
@@ -112,22 +116,27 @@ let oxana_router = oxana_web::router(OxanaWebState::new(
 let app = your_app_router().nest("/oxana", oxana_router);
 ```
 
-The dashboard exposes these pages:
+The dashboard shows active jobs, queues, worker metrics, cron schedules, scheduled jobs, retries, and dead jobs. Management actions include:
 
-- `/` - Overview with job stats
-- `/busy` - Currently processing jobs
-- `/queues` - All queues with stats
-- `/queues/{queue_key}` - Jobs in a specific queue
-- `/jobs/{job_id}` - Details for a specific job
-- `/metrics` - Worker execution metrics
-- `/metrics/job?worker=...` - Metrics for a specific worker
-- `/cron` - Cron job schedules
-- `/on-demand` - Manually enqueue registered on-demand jobs
-- `/scheduled` - Scheduled jobs
-- `/retries` - Jobs pending retry
-- `/dead` - Dead letter queue
+- Manually trigger cron jobs or enqueue jobs marked `#[oxana(on_demand)]`.
+- Pause and resume queues, or change dynamic queue concurrency.
+- Retry all pending retries immediately or revive all dead jobs.
+- Delete individual jobs or clear queues.
 
-It also provides management actions for pausing and unpausing queues, changing dynamic queue concurrency from queue detail pages, wiping queues, and deleting individual jobs.
+Routes below are relative to the mount path (`/oxana` in the example):
+
+- `/` — overview and job statistics
+- `/busy` — jobs currently being processed
+- `/queues` and `/queues/{queue_key}` — queue statistics and queued jobs
+- `/jobs/{job_id}` — job details, including state, progress, and errors
+- `/metrics` and `/metrics/job?worker=...` — execution metrics and worker details
+- `/cron` — cron schedules
+- `/on-demand` — manually enqueue registered on-demand jobs
+- `/scheduled`, `/retries`, and `/dead` — scheduled jobs, pending retries, and dead jobs
+
+See the [web example](https://github.com/pragmaplatform/oxana/blob/main/oxana-web/examples/web.rs) for a complete application. The router exposes job data and management actions; apply your application's authentication and access controls when mounting it.
+
+For monitoring through MCP clients, use the separate [oxana-mcp crate](https://github.com/pragmaplatform/oxana/tree/main/oxana-mcp). It serves bearer-authenticated, read-only tools for queue statistics, jobs, processes, and metrics.
 
 ## Core Concepts
 
@@ -176,7 +185,7 @@ Queue attributes:
 
 ### Component Registry
 
-The component registry automatically discovers and registers all workers and queues in your application. Use `#[derive(oxana::Registry)]` to create a registry and `storage.runtime(ctx).register::<ComponentRegistry>()` to register them on a typed runtime.
+With the `registry` feature enabled, derives register components with their selected registry. Use `#[derive(oxana::Registry)]` to define the registry and `storage.runtime(ctx).register::<ComponentRegistry>()` to add its components to a typed runtime. Without this feature, register queues and workers explicitly with `.queue::<MyQueue>()` and `.worker::<MyWorker, MyJob>()`.
 
 ### Storage
 
@@ -185,6 +194,10 @@ The component registry automatically discovers and registers all workers and que
 Build it with `Storage::from_env()` or `Storage::builder().build_from_env()`, which read the `REDIS_URL` environment variable.
 Set `REDIS_STATS_URL` to store counters and metrics in a separate Redis instance; when it is not set, stats use `REDIS_URL`.
 Call `storage.runtime(ctx)` to create a typed worker runtime, register queues and workers on that runtime, then call `runtime.run().await`.
+
+Use `enqueue` for immediate work, `enqueue_in` or `enqueue_at` for delayed work, and `enqueue_list` for bulk enqueueing. For unique jobs, `try_enqueue` returns `Some(job_id)` when inserted or replaced and `None` when skipped. Storage failures return an error.
+
+### Redis Connection Retries
 
 Claimed-job start, acknowledgment, retry, and dead-letter transitions retry
 transient connection-acquisition failures by default. The total checkout budget
@@ -216,17 +229,15 @@ statistics, or other ordinary pool access. Commands already sent are never
 replayed, and job retry counts are unaffected by acquiring a connection.
 
 Claims and execution slots remain occupied while waiting. Larger windows delay
-shutdown after a persistent acquisition failure. No heartbeat threshold changes
-or coordinated rollout are required. Execution remains at least once.
+shutdown after a persistent acquisition failure. Execution remains at least once.
 
 ### Context
 
-The context provides shared state and utilities to workers. It can include:
+Application context and job context have separate roles. Pass shared application resources, such as database pools and configuration, to `storage.runtime(app_context)`.
 
-- Database connections
-- Configuration
-- Shared resources
-- Job state (for resumable jobs)
+The `Worker` derive supports unit or empty workers, and workers with exactly one named field of the context type, which receives a clone of the context. For other layouts, implement `Worker<Args>` and `FromContext<C>` manually instead of using the derive.
+
+Each execution also receives a `JobContext` with job metadata and persistent state.
 
 Workers can persist job state with `ctx.state.update(...)` and read the state from
 the current attempt with `ctx.state.get::<T>()`. This is useful for resumable jobs
@@ -256,6 +267,8 @@ Runtime configuration is done on the typed runtime builder, which allows you to:
 - Set up graceful shutdown
 - Configure exit conditions and runtime timing/backoff knobs
 - Customize how worker errors are stored on retry and dead jobs
+
+#### Queue Selection
 
 To run only selected queues while keeping every queue and worker registered,
 call `only_queue` once for each queue to process:
@@ -292,6 +305,16 @@ for excluded queues are not scheduled.
 
 `Storage` remains the enqueueing and monitoring handle; `RuntimeBuilder<C>` is the worker setup and execution handle for app context type `C`.
 
+#### Shutdown
+
+The default shutdown listener handles SIGTERM/SIGINT on Unix and Ctrl+C on Windows. Shutdown stops fetching new work and lets workers drain. A shared 180-second deadline covers workers, background tasks, and process deregistration. Use `.shutdown_timeout(duration)` to change it or `.disable_shutdown_timeout()` to wait indefinitely.
+
+At the deadline, unfinished asynchronous tasks are cancelled and interrupted jobs remain eligible for recovery unless resurrection is disabled for their job type. `run()` returns `OxanaError::ShutdownTimeout` after an ordinary shutdown signal, or preserves the initiating error if a runtime failure triggered shutdown.
+
+### Error and Panic Reporting
+
+Library operations return `OxanaError`. Set a worker's associated error type with `#[oxana(error = MyError)]`; otherwise the derive uses `oxana::BoxError`. Custom error types must satisfy `IntoWorkerError + Send + Sync + 'static`; types implementing `std::error::Error + Send + Sync + 'static` meet that requirement automatically.
+
 Worker errors use their `Debug` representation by default so error types that capture backtraces
 can include them in the dashboard. Applications can override the stored representation when needed:
 
@@ -301,14 +324,7 @@ let runtime = storage
     .error_formatter(|error| error.to_string());
 ```
 
-**Breaking default behavior change in 2.3.0:** built-in worker panic
-reporting now requires the opt-in `sentry-panic` feature. Defaults include `sentry` but exclude `sentry-panic`. Panic catching,
-failure storage, retries, batch handling, worker survival, and custom `failure_reporter`
-callbacks remain enabled in every feature configuration.
-
-Keep `sentry` enabled and omit `sentry-panic` for returned-error reporting only.
-To restore built-in panic reporting from 2.2.0 and earlier, add `"sentry-panic"` to the Oxana dependency's
-`features` list after upgrading to 2.3.0.
+The default `sentry` feature reports returned worker errors. Enable `sentry-panic` to also report worker panics. Panic catching, failure storage, retries, and custom `failure_reporter` callbacks work with either setting and with Sentry disabled.
 
 With the `sentry` feature enabled, returned worker errors are reported once by default with isolated
 `oxana.*` tags and an `oxana` context containing job IDs, queue/job/worker names, batch size, and
@@ -373,10 +389,6 @@ Backtraces must be enabled before the process starts (for example with `RUST_BAC
 captured by the application's error type. Diagnostic output may contain sensitive details, so only
 enable backtraces where access to stored job errors is appropriately restricted.
 
-### Error Handling
-
-Oxana uses a custom `OxanaError` type that covers all library error cases. Workers can define their own error type that implements `std::error::Error`.
-
 ### Prometheus Metrics
 
 Enable the `prometheus` feature to expose metrics:
@@ -389,27 +401,16 @@ let output = metrics.encode_to_string()?;
 
 ## Comparison with Similar Libraries
 
-| Feature | Oxana | [Apalis](https://crates.io/crates/apalis) | [rusty-sidekiq](https://crates.io/crates/rusty-sidekiq) | [Fang](https://crates.io/crates/fang) |
-|---|---|---|---|---|
-| Backend | Redis | Redis, Postgres, `SQLite`, `MySQL`, AMQP, NATS | Redis | Postgres, `SQLite`, `MySQL` |
-| Retries | Yes | Yes (tower layer) | Yes | Yes |
-| Scheduled Jobs | Yes | Yes | Yes | Yes |
-| Cron | Yes | Yes | Yes | Yes |
-| Unique Jobs | Yes | No | Yes | Yes |
-| Throttling | Yes | No | No | No |
-| Dynamic Queues | Yes | No | No | No |
-| Resumable Jobs | Yes | No | No | No |
-| Graceful Shutdown | Yes | Yes | Partial | No |
-| Web UI | Yes | Yes (apalis-board) | No (uses Ruby Sidekiq UI) | No |
-| License | MIT | MIT | MIT | MIT |
+These libraries differ in storage, worker APIs, and integrations. The comparison below reflects the linked project documentation checked on 2026-10-29; backend and feature choices can affect availability.
 
-**Oxana** focuses on depth with a single Redis backend rather than breadth across multiple backends. It is the only Rust job library offering resumable jobs and combines unique jobs, throttling, and a built-in web dashboard in one package.
+| Library | Storage | Worker model and documented capabilities |
+| --- | --- | --- |
+| **Oxana 2.5** | Redis | Typed jobs and workers; static and dynamic queues; per-queue throttling; unique jobs; persisted job state and progress; batch processing; `oxana-web` dashboard and read-only MCP tools. |
+| **[Apalis 1.0](https://docs.rs/apalis/latest/apalis/)** | Redis, PostgreSQL, SQLite, MySQL, and additional queue backends | Async task handlers with Tower middleware; rate limits; deduplication; resumable jobs and workflows; `apalis-board` web UI. Capabilities vary by backend and crate. |
+| **[rusty-sidekiq 0.15](https://docs.rs/crate/rusty-sidekiq/latest)** | Redis | Rust client and workers compatible with Ruby Sidekiq; server middleware; cron; unique jobs with a configurable TTL based on worker, queue, and arguments. |
+| **[Fang 0.11](https://docs.rs/fang/0.11.0/fang/)** | PostgreSQL, SQLite, MySQL | Async or threaded workers; scheduled and cron tasks; unique tasks; task-type filtering; configurable retry backoff. |
 
-**Apalis** offers the most backend options and integrates with the tower middleware ecosystem, making it highly extensible. It suits projects that need backend flexibility or already use tower layers. However, its breadth of abstraction can come at the cost of reliability and debuggability in production.
-
-**rusty-sidekiq** is wire-compatible with Ruby Sidekiq, making it ideal for teams migrating from or coexisting with Ruby services. It can share queues with Ruby Sidekiq workers and use the existing Sidekiq web UI.
-
-**Fang** is SQL-database-backed (no Redis dependency) with both async and threaded execution modes. A good fit for projects that prefer Postgres/SQLite over Redis.
+Oxana fits applications that want Redis queues with built-in queue controls, job checkpoints, and monitoring. Apalis offers backend choice, Tower middleware, and workflow composition. rusty-sidekiq is useful when Rust and Ruby services need to exchange Sidekiq jobs. Fang keeps the queue in a SQL database and supports both async and threaded execution.
 
 ## License
 
