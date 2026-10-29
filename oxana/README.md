@@ -35,8 +35,10 @@ Oxana focuses on simplicity and depth over breadth - one backend, done well.
 
 ## Quick Start
 
+Requires Rust 1.89 or newer.
+
 ```bash
-cargo add oxana@2.4.1 --features registry
+cargo add oxana@2.5.0 --features registry
 ```
 
 The `registry` feature (not enabled by default) powers `#[derive(oxana::Registry)]` and `runtime.register::<...>()` used below; without it, register queues and workers explicitly with `runtime.queue::<...>()` and `runtime.worker::<...>()`.
