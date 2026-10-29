@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Add `StorageBuilder::claimed_connection_retries` and `PoolRetryConfig` to override the claimed-job acquisition window and backoff, or disable acquisition retries. Defaults retain the timeout-derived budget and 100 ms to one-second backoff. Heartbeats and ordinary pool access are unaffected.
+
+### Fixed
+
+- Bound claimed-job connection acquisition from the first attempt, including pools with unset timeouts. The configured or derived retry window now limits the entire checkout rather than starting after the first failure.
+- Apply configured Redis connection and response timeouts during setup instead of after connection creation, so Redis's default 500 ms response deadline cannot override a longer pool creation timeout. Requires deadpool-redis 0.23.1 or later.
+
 ## [2.4.1] - 2026-10-28
 
 ### Fixed

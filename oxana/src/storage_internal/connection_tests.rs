@@ -120,14 +120,12 @@ async fn claimed_connection_recovers_after_long_pool_wait_timeouts() -> TestResu
     tokio::pin!(connection);
     assert!(connection.as_mut().now_or_never().is_none());
 
-    // The first three-second failure starts a separate six-second retry budget.
+    // The first three-second failure leaves three seconds of the total budget.
     tokio::time::advance(Duration::from_secs(3)).await;
     assert!(connection.as_mut().now_or_never().is_none());
     tokio::time::advance(Duration::from_millis(100)).await;
     assert!(connection.as_mut().now_or_never().is_none());
-    // A second acquisition can use its full timeout without exhausting the budget.
-    // The former fixed two-second budget would already have returned an error.
-    tokio::time::advance(Duration::from_secs(3)).await;
+    tokio::time::advance(Duration::from_secs(1)).await;
     assert!(connection.as_mut().now_or_never().is_none());
 
     // Resume real time before recycling the connection over the Redis socket.
@@ -161,8 +159,8 @@ async fn claimed_connection_exhausts_default_and_scaled_pool_wait_budgets() -> T
                 deadpool_redis::PoolError::Timeout(deadpool_redis::TimeoutType::Wait)
             ))
         ));
-        assert!(elapsed >= wait + budget);
-        assert!(elapsed <= wait + budget + Duration::from_millis(10));
+        assert!(elapsed >= budget);
+        assert!(elapsed <= budget + Duration::from_millis(10));
         assert_eq!(storage.pool.status().waiting, 0);
     }
     Ok(())
@@ -180,6 +178,231 @@ async fn claimed_connection_does_not_retry_closed_pool() -> TestResult {
             deadpool_redis::PoolError::Closed
         ))
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn claimed_connection_bounds_the_first_acquisition_without_pool_timeouts() -> TestResult {
+    dotenvy::from_filename(".env.test").ok();
+    let storage = crate::Storage::builder()
+        .max_pool_size(1)
+        .timeouts(crate::StorageBuilderTimeouts {
+            wait: None,
+            create: None,
+            recycle: None,
+        })
+        .build_from_redis_url(std::env::var("REDIS_URL")?)?
+        .internal;
+    let _held = storage.connection().await?;
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let result =
+        tokio::time::timeout(Duration::from_secs(3), storage.claimed_connection("start")).await;
+    assert!(matches!(result, Ok(Err(OxanaError::DeadpoolRedisError(error))) if error.is_timeout()));
+    assert!(
+        (Duration::from_secs(2)..=Duration::from_secs(2) + Duration::from_millis(1))
+            .contains(&started.elapsed())
+    );
+    assert_eq!(storage.pool.status().waiting, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn custom_retry_window_limits_the_first_acquisition() -> TestResult {
+    dotenvy::from_filename(".env.test").ok();
+    let storage = crate::Storage::builder()
+        .max_pool_size(1)
+        .timeouts(crate::StorageBuilderTimeouts::new(Duration::from_secs(3)))
+        .claimed_connection_retries(Some(PoolRetryConfig {
+            retry_window: Some(Duration::from_millis(150)),
+            ..Default::default()
+        }))
+        .build_from_redis_url(std::env::var("REDIS_URL")?)?
+        .internal;
+    let _held = storage.connection().await?;
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let result = storage.claimed_connection("start").await;
+    assert!(matches!(result, Err(OxanaError::DeadpoolRedisError(error)) if error.is_timeout()));
+    assert!(
+        (Duration::from_millis(150)..=Duration::from_millis(150) + Duration::from_millis(1))
+            .contains(&started.elapsed())
+    );
+    assert_eq!(storage.pool.status().waiting, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn claimed_connection_uses_configured_exponential_backoff_with_jitter() -> TestResult {
+    dotenvy::from_filename(".env.test").ok();
+    let wait = Duration::from_millis(20);
+    let storage = crate::Storage::builder()
+        .max_pool_size(1)
+        .timeouts(crate::StorageBuilderTimeouts::new(wait))
+        .claimed_connection_retries(Some(PoolRetryConfig {
+            retry_window: Some(Duration::from_secs(30)),
+            initial_backoff: Duration::from_secs(2),
+            max_backoff: Duration::from_secs(5),
+        }))
+        .build_from_redis_url(std::env::var("REDIS_URL")?)?
+        .internal;
+    let _held = storage.connection().await?;
+    tokio::time::pause();
+    let connection = storage.claimed_connection("start");
+    tokio::pin!(connection);
+    assert!(connection.as_mut().now_or_never().is_none());
+    assert_eq!(storage.pool.status().waiting, 1);
+
+    // A held slot makes each attempt visible as a pool waiter. Between attempts,
+    // jitter must keep the delay within half to all of the exponential ceiling.
+    let tick = Duration::from_millis(1);
+    for (retry, ceiling) in [2, 4, 5, 5].into_iter().enumerate() {
+        let ceiling = Duration::from_secs(ceiling);
+        tokio::time::advance(wait + tick).await;
+        assert!(connection.as_mut().now_or_never().is_none());
+        assert_eq!(storage.pool.status().waiting, 0);
+        let started = tokio::time::Instant::now();
+
+        while storage.pool.status().waiting == 0 {
+            tokio::time::advance(tick).await;
+            assert!(connection.as_mut().now_or_never().is_none());
+            assert!(
+                started.elapsed() <= ceiling + tick,
+                "retry {retry} exceeded its backoff ceiling"
+            );
+        }
+        assert!(
+            started.elapsed() >= ceiling / 2,
+            "retry {retry} started before its minimum jittered delay"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn custom_retries_only_extend_claimed_connections_and_follow_new_processes() -> TestResult {
+    dotenvy::from_filename(".env.test").ok();
+    let storage = crate::Storage::builder()
+        .max_pool_size(1)
+        .timeouts(crate::StorageBuilderTimeouts::new(Duration::from_millis(
+            20,
+        )))
+        .claimed_connection_retries(Some(PoolRetryConfig {
+            retry_window: Some(Duration::from_millis(750)),
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(50),
+        }))
+        .build_from_redis_url(std::env::var("REDIS_URL")?)?
+        .internal;
+    let disabled = crate::Storage::builder()
+        .claimed_connection_retries(None)
+        .build_from_pool(storage.pool.clone())?
+        .internal;
+    let _held = storage.connection().await?;
+    tokio::time::pause();
+
+    for operation in ["heartbeat", "statistics", "ordinary", "disabled"] {
+        let started = tokio::time::Instant::now();
+        let result = match operation {
+            "heartbeat" => storage.ping().await,
+            "statistics" => storage.stats_connection().await.map(|_| ()),
+            "ordinary" => storage.connection().await.map(|_| ()),
+            _ => disabled.claimed_connection("start").await.map(|_| ()),
+        };
+        assert!(result.is_err(), "{operation}");
+        assert!(
+            started.elapsed() <= Duration::from_millis(30),
+            "{operation}"
+        );
+    }
+
+    let started = tokio::time::Instant::now();
+    assert!(
+        storage
+            .for_new_process()
+            .claimed_connection("start")
+            .await
+            .is_err()
+    );
+    assert!(
+        (Duration::from_millis(750)..=Duration::from_millis(750) + Duration::from_millis(1))
+            .contains(&started.elapsed())
+    );
+    assert_eq!(storage.pool.status().waiting, 0);
+    Ok(())
+}
+
+#[test]
+fn all_builders_preserve_the_claimed_connection_policy() -> TestResult {
+    let url = "redis://127.0.0.1/0";
+    let pool =
+        deadpool_redis::Config::from_url(url).create_pool(Some(deadpool_redis::Runtime::Tokio1))?;
+    for config in [
+        None,
+        Some(PoolRetryConfig::default()),
+        Some(PoolRetryConfig {
+            retry_window: Some(Duration::from_secs(5)),
+            initial_backoff: Duration::from_millis(250),
+            max_backoff: Duration::from_secs(2),
+        }),
+    ] {
+        let builder = || crate::Storage::builder().claimed_connection_retries(config);
+        for storage in [
+            builder().build_from_redis_url(url)?,
+            builder().build_from_redis_urls(url, url)?,
+            builder().build_from_pool(pool.clone())?,
+            builder().build_from_pools(pool.clone(), pool.clone())?,
+        ] {
+            assert_eq!(storage.internal.claimed_connection_retries, config);
+            assert_eq!(
+                storage
+                    .internal
+                    .for_new_process()
+                    .claimed_connection_retries,
+                config
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn all_builders_reject_invalid_claimed_connection_policies() -> TestResult {
+    let url = "redis://127.0.0.1/0";
+    let pool =
+        deadpool_redis::Config::from_url(url).create_pool(Some(deadpool_redis::Runtime::Tokio1))?;
+    for config in [
+        PoolRetryConfig {
+            retry_window: Some(Duration::ZERO),
+            ..Default::default()
+        },
+        PoolRetryConfig {
+            retry_window: Some(Duration::MAX),
+            ..Default::default()
+        },
+        PoolRetryConfig {
+            initial_backoff: Duration::ZERO,
+            ..Default::default()
+        },
+        PoolRetryConfig {
+            max_backoff: Duration::from_millis(50),
+            ..Default::default()
+        },
+        PoolRetryConfig {
+            max_backoff: Duration::MAX,
+            ..Default::default()
+        },
+    ] {
+        let builder = || crate::Storage::builder().claimed_connection_retries(Some(config));
+        for result in [
+            builder().build_from_redis_url(url),
+            builder().build_from_redis_urls(url, url),
+            builder().build_from_pool(pool.clone()),
+            builder().build_from_pools(pool.clone(), pool.clone()),
+        ] {
+            assert!(matches!(result, Err(OxanaError::ConfigError(_))));
+        }
+    }
     Ok(())
 }
 

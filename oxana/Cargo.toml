@@ -26,7 +26,7 @@ prometheus = ["prometheus-client"]
 async-trait = "0.1"
 chrono = { version = "^0.4", features = ["serde"] }
 cron = "^0.17"
-deadpool-redis = { version = "^0.23", features = ["script"] }
+deadpool-redis = { version = "^0.23.1", features = ["script"] }
 futures = { version = "^0.3" }
 gethostname = "^1.1"
 inventory = { version = "0.3", optional = true }

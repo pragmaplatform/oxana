@@ -9,7 +9,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    OxanaError,
+    OxanaError, PoolRetryConfig,
     job_envelope::{JobConflictStrategy, JobEnvelope, JobId},
     metrics::*,
     queue::{QueueRuntimeConfig, QueueState},
@@ -74,6 +74,7 @@ fn enqueue_list_chunks(envelopes: &[JobEnvelope]) -> std::slice::Chunks<'_, JobE
 pub(crate) struct StorageInternal {
     pool: deadpool_redis::Pool,
     stats_pool: Option<deadpool_redis::Pool>,
+    claimed_connection_retries: Option<PoolRetryConfig>,
     keys: StorageKeys,
     started_at: i64,
     instance_id: String,
@@ -152,6 +153,14 @@ struct QueueStatsInputs {
 }
 
 impl StorageInternal {
+    pub(crate) fn with_claimed_connection_retries(
+        mut self,
+        config: Option<PoolRetryConfig>,
+    ) -> Self {
+        self.claimed_connection_retries = config;
+        self
+    }
+
     pub(crate) fn with_dead_job_limit(mut self, limit: Option<usize>) -> Self {
         self.dead_job_limit = limit;
         self
@@ -178,6 +187,7 @@ impl StorageInternal {
         Self {
             pool,
             stats_pool,
+            claimed_connection_retries: Some(PoolRetryConfig::default()),
             keys,
             started_at: chrono::Utc::now().timestamp(),
             instance_id: uuid::Uuid::new_v4().simple().to_string(),
@@ -194,6 +204,7 @@ impl StorageInternal {
             Some(self.keys.namespace.clone()),
         )
         .with_dead_job_limit(self.dead_job_limit)
+        .with_claimed_connection_retries(self.claimed_connection_retries)
     }
 
     fn record_redis_success(&self) {
@@ -264,25 +275,36 @@ impl StorageInternal {
 
     /// Retry acquisition only, before sending a claimed-job transition. Once a
     /// command is sent its result may be ambiguous, so callers must not replay it.
-    /// The window starts after the first failure and is at least two seconds or
-    /// twice the longest configured pool timeout, whichever is greater. Unset
-    /// timeouts do not extend it. It does not use the shared failure counter,
-    /// which successful heartbeats can reset.
+    /// The deadline includes the first attempt. It does not use the shared
+    /// failure counter, which successful heartbeats can reset.
     async fn claimed_connection(
         &self,
         operation: &'static str,
     ) -> Result<deadpool_redis::Connection, OxanaError> {
-        let mut result = self.pool.get().await;
-        let retry_started = tokio::time::Instant::now();
-        let timeouts = self.pool.timeouts();
-        let retry_window = [timeouts.wait, timeouts.create, timeouts.recycle]
-            .into_iter()
-            .flatten()
-            .max()
-            .unwrap_or_default()
-            .saturating_mul(2)
-            .max(MIN_CLAIMED_CONNECTION_RETRY_WINDOW);
-        let mut backoff_ms = 100_u64;
+        let Some(config) = self.claimed_connection_retries else {
+            return self.connection().await;
+        };
+        let retry_window = config.retry_window.unwrap_or_else(|| {
+            let timeouts = self.pool.timeouts();
+            [timeouts.wait, timeouts.create, timeouts.recycle]
+                .into_iter()
+                .flatten()
+                .max()
+                .unwrap_or_default()
+                .saturating_mul(2)
+                .max(MIN_CLAIMED_CONNECTION_RETRY_WINDOW)
+        });
+        let deadline = tokio::time::Instant::now()
+            .checked_add(retry_window)
+            .ok_or_else(|| OxanaError::ConfigError("pool retry deadline is out of range".into()))?;
+        let mut result = tokio::time::timeout_at(deadline, self.pool.get())
+            .await
+            .map_err(|elapsed| {
+                OxanaError::DeadpoolRedisError(
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, elapsed).into(),
+                )
+            })?;
+        let mut backoff = config.initial_backoff;
         loop {
             let error = match result {
                 Ok(connection) => return Ok(connection),
@@ -294,8 +316,10 @@ impl StorageInternal {
                 }
                 Err(error) => return Err(error.into()),
             };
-            let half = backoff_ms / 2;
-            let delay_ms = half + uuid::Uuid::new_v4().as_u64_pair().1 % (half + 1);
+            let half = backoff / 2;
+            let jitter = u32::from(uuid::Uuid::new_v4().as_bytes()[0]);
+            // Scale before multiplying to avoid overflowing long backoffs.
+            let delay = half + (backoff - half) / 255 * jitter;
             let status = self.pool.status();
             tracing::warn!(
                 operation,
@@ -303,22 +327,19 @@ impl StorageInternal {
                 pool_size = status.size,
                 pool_available = status.available,
                 pool_waiting = status.waiting,
-                retry_in_ms = delay_ms,
+                retry_in_ms = delay.as_millis(),
                 "Retrying claimed job Redis connection"
             );
-            result = match tokio::time::timeout(
-                retry_window.saturating_sub(retry_started.elapsed()),
-                async {
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                    self.pool.get().await
-                },
-            )
+            result = match tokio::time::timeout_at(deadline, async {
+                tokio::time::sleep(delay).await;
+                self.pool.get().await
+            })
             .await
             {
                 Ok(result) => result,
                 Err(_) => return Err(error.into()),
             };
-            backoff_ms = (backoff_ms * 2).min(1000);
+            backoff = backoff.saturating_mul(2).min(config.max_backoff);
         }
     }
 

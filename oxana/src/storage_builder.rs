@@ -1,7 +1,6 @@
-use deadpool_redis::Hook;
 use std::time::Duration;
 
-use crate::{OxanaError, Storage, storage_internal::StorageInternal};
+use crate::{OxanaError, PoolRetryConfig, Storage, storage_internal::StorageInternal};
 
 const DEFAULT_REDIS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -10,6 +9,7 @@ pub struct StorageBuilder {
     namespace: Option<String>,
     max_pool_size: Option<usize>,
     timeouts: Option<StorageBuilderTimeouts>,
+    claimed_connection_retries: Option<PoolRetryConfig>,
     redis_response_timeout: Option<Duration>,
     dead_job_limit: Option<std::num::NonZeroUsize>,
 }
@@ -63,6 +63,7 @@ impl StorageBuilder {
             namespace: None,
             max_pool_size: None,
             timeouts: None,
+            claimed_connection_retries: Some(PoolRetryConfig::default()),
             redis_response_timeout: None,
             dead_job_limit: std::num::NonZeroUsize::new(1000),
         }
@@ -92,6 +93,19 @@ impl StorageBuilder {
         self
     }
 
+    /// Configures connection-acquisition retries before claimed-job start,
+    /// acknowledgment, retry, and dead-letter transitions, including supplied pools.
+    /// Defaults to `Some(PoolRetryConfig::default())`; `None` disables retries
+    /// and uses the pool's own checkout deadlines.
+    ///
+    /// The retry window covers the first attempt and backoff. Heartbeats and
+    /// other pool access retain their existing behavior. Commands already sent
+    /// are never replayed. Invalid durations are rejected when building storage.
+    pub fn claimed_connection_retries(mut self, config: Option<PoolRetryConfig>) -> Self {
+        self.claimed_connection_retries = config;
+        self
+    }
+
     pub fn redis_response_timeout(mut self, timeout: Duration) -> Self {
         self.redis_response_timeout = Some(timeout);
         self
@@ -106,10 +120,7 @@ impl StorageBuilder {
                 .unwrap_or(DEFAULT_REDIS_RESPONSE_TIMEOUT),
         )?;
 
-        Ok(Storage::new(
-            StorageInternal::new(pool, self.namespace)
-                .with_dead_job_limit(self.dead_job_limit.map(std::num::NonZeroUsize::get)),
-        ))
+        self.build_from_pool(pool)
     }
 
     pub fn build_from_redis_urls(
@@ -126,10 +137,7 @@ impl StorageBuilder {
         let stats_pool =
             Self::build_redis_pool(stats_url, max_pool_size, timeouts, redis_response_timeout)?;
 
-        Ok(Storage::new(
-            StorageInternal::with_stats_pool(pool, stats_pool, self.namespace)
-                .with_dead_job_limit(self.dead_job_limit.map(std::num::NonZeroUsize::get)),
-        ))
+        self.build_from_pools(pool, stats_pool)
     }
 
     fn build_redis_pool(
@@ -138,23 +146,22 @@ impl StorageBuilder {
         timeouts: StorageBuilderTimeouts,
         redis_response_timeout: Duration,
     ) -> Result<deadpool_redis::Pool, OxanaError> {
-        let mut cfg = deadpool_redis::Config::from_url(url);
-        cfg.pool = Some(deadpool_redis::PoolConfig {
+        // Configure the connection before setup commands run; a post-create hook
+        // is too late to override Redis's default 500ms response timeout.
+        let manager = deadpool_redis::Manager::new_with_config(
+            url.into(),
+            deadpool_redis::redis::AsyncConnectionConfig::new()
+                .set_connection_timeout(timeouts.create)
+                .set_response_timeout(Some(redis_response_timeout)),
+        )?;
+        let config = deadpool_redis::PoolConfig {
             max_size: max_pool_size,
             timeouts: timeouts.into(),
             queue_mode: Default::default(),
-        });
+        };
 
-        Ok(cfg
-            .builder()?
-            .post_create(Hook::sync_fn(move |conn, _| {
-                // redis 1.0 introduced a default 500ms response_timeout on
-                // MultiplexedConnection. This causes blocking Redis commands
-                // (BLMOVE, BLPOP, etc.) to time out prematurely. Disable it
-                // so that command-level timeouts govern blocking behavior.
-                conn.set_response_timeout(redis_response_timeout);
-                Ok(())
-            }))
+        Ok(deadpool_redis::Pool::builder(manager)
+            .config(config)
             .runtime(deadpool_redis::Runtime::Tokio1)
             .build()?)
     }
@@ -185,7 +192,11 @@ impl StorageBuilder {
     /// `redis_response_timeout` settings do not apply here — the provided pool
     /// is used as-is.
     pub fn build_from_pool(self, pool: deadpool_redis::Pool) -> Result<Storage, OxanaError> {
+        if let Some(config) = self.claimed_connection_retries {
+            config.validate()?;
+        }
         let internal = StorageInternal::new(pool, self.namespace)
+            .with_claimed_connection_retries(self.claimed_connection_retries)
             .with_dead_job_limit(self.dead_job_limit.map(std::num::NonZeroUsize::get));
         Ok(Storage::new(internal))
     }
@@ -200,7 +211,11 @@ impl StorageBuilder {
         pool: deadpool_redis::Pool,
         stats_pool: deadpool_redis::Pool,
     ) -> Result<Storage, OxanaError> {
+        if let Some(config) = self.claimed_connection_retries {
+            config.validate()?;
+        }
         let internal = StorageInternal::with_stats_pool(pool, stats_pool, self.namespace)
+            .with_claimed_connection_retries(self.claimed_connection_retries)
             .with_dead_job_limit(self.dead_job_limit.map(std::num::NonZeroUsize::get));
         Ok(Storage::new(internal))
     }
@@ -208,7 +223,34 @@ impl StorageBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::StorageBuilder;
+    use super::{Duration, StorageBuilder, StorageBuilderTimeouts};
+
+    #[tokio::test]
+    async fn configured_response_timeout_applies_during_connection_setup() -> testresult::TestResult
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("redis://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = [0; 1024];
+            assert!(stream.read(&mut request).await? > 0);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            stream.write_all(b"+OK\r\n+OK\r\n").await
+        });
+        let pool = StorageBuilder::build_redis_pool(
+            url,
+            1,
+            StorageBuilderTimeouts::new(Duration::from_secs(2)),
+            Duration::from_secs(2),
+        )?;
+        let connection = pool.get().await;
+        let response = server.await?;
+        connection?;
+        response?;
+        Ok(())
+    }
 
     #[test]
     fn build_from_redis_url_uses_primary_pool_for_stats() {

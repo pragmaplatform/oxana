@@ -330,10 +330,11 @@ where
     /// After a transient payload-read failure, preparation retries for up to
     /// five seconds with backoff and jitter, retaining the claim and concurrency
     /// permit. Connection acquisition for job start, acknowledgment, retry and
-    /// dead-letter transitions retries after the first transient failure for
-    /// two seconds or twice the longest configured pool timeout, whichever is
-    /// greater. Unset timeouts do not extend this budget. Transition commands
-    /// that may have been sent are not replayed.
+    /// dead-letter transitions defaults to a total budget of two seconds or
+    /// twice the longest configured pool timeout, whichever is greater, including
+    /// the first attempt. Unset timeouts do not extend this budget. Override or
+    /// disable this policy with [`crate::StorageBuilder::claimed_connection_retries`].
+    /// Transition commands that may have been sent are not replayed.
     /// Other preparation failures, exhausted retries, and uncertain
     /// claims initiate shutdown regardless of this threshold. Redis may already
     /// hold the claim, and a live runtime's heartbeat prevents its recovery.

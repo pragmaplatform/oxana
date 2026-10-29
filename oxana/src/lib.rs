@@ -86,6 +86,7 @@ mod job_envelope;
 mod job_state;
 mod launcher;
 mod metrics;
+mod pool_retry_config;
 mod queue;
 mod result_collector;
 mod runtime;
@@ -121,6 +122,7 @@ pub use crate::job_envelope::{
 };
 pub use crate::job_state::{JobProgress, JobProgressIterator, JobState};
 pub use crate::metrics::*;
+pub use crate::pool_retry_config::PoolRetryConfig;
 pub use crate::queue::{
     Queue, QueueConcurrency, QueueConfig, QueueKind, QueueRuntimeConfig, QueueState, QueueThrottle,
     value_to_queue_key,

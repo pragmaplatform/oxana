@@ -184,6 +184,39 @@ Build it with `Storage::from_env()` or `Storage::builder().build_from_env()`, wh
 Set `REDIS_STATS_URL` to store counters and metrics in a separate Redis instance; when it is not set, stats use `REDIS_URL`.
 Call `storage.runtime(ctx)` to create a typed worker runtime, register queues and workers on that runtime, then call `runtime.run().await`.
 
+Claimed-job start, acknowledgment, retry, and dead-letter transitions retry
+transient connection-acquisition failures by default. The total checkout budget
+is two seconds or twice the longest configured pool timeout, whichever is
+greater. It includes the first attempt and backoff; unset pool timeouts do not
+extend it. Backoff starts at 100 ms and doubles up to one second, with each delay
+randomly selected between half and all of that ceiling.
+
+Override the policy when needed:
+
+```rust
+use std::time::Duration;
+use oxana::{PoolRetryConfig, Storage};
+
+let storage = Storage::builder()
+    .claimed_connection_retries(Some(PoolRetryConfig {
+        retry_window: Some(Duration::from_secs(5)),
+        initial_backoff: Duration::from_millis(100),
+        max_backoff: Duration::from_secs(1),
+    }))
+    .build_from_env()?;
+```
+
+`PoolRetryConfig::retry_window: None` keeps the automatic timeout-derived budget.
+`claimed_connection_retries(None)` disables this policy and uses the pool's own
+checkout deadlines. The policy also applies to supplied primary pools and new
+runtime/drain process identities. It does not apply to heartbeats, enqueueing,
+statistics, or other ordinary pool access. Commands already sent are never
+replayed, and job retry counts are unaffected by acquiring a connection.
+
+Claims and execution slots remain occupied while waiting. Larger windows delay
+shutdown after a persistent acquisition failure. No heartbeat threshold changes
+or coordinated rollout are required. Execution remains at least once.
+
 ### Context
 
 The context provides shared state and utilities to workers. It can include:
