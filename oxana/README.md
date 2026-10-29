@@ -118,6 +118,17 @@ let app = your_app_router().nest("/oxana", oxana_router);
 
 The dashboard shows active jobs, queues, worker metrics, cron schedules, scheduled jobs, retries, and dead jobs. It also supports manual enqueueing of jobs marked `#[oxana(on_demand)]`, queue pause/resume, dynamic concurrency changes, retrying failed jobs, and deleting jobs or clearing queues.
 
+Routes below are relative to the mount path (`/oxana` in the example):
+
+- `/` — overview and job statistics
+- `/busy` — jobs currently being processed
+- `/queues` and `/queues/{queue_key}` — queue statistics and queued jobs
+- `/jobs/{job_id}` — job details, including state, progress, and errors
+- `/metrics` and `/metrics/job?worker=...` — execution metrics and worker details
+- `/cron` — cron schedules
+- `/on-demand` — manually enqueue registered on-demand jobs
+- `/scheduled`, `/retries`, and `/dead` — scheduled jobs, pending retries, and dead jobs
+
 See the [web example](https://github.com/pragmaplatform/oxana/blob/main/oxana-web/examples/web.rs) for a complete application. The router exposes job data and management actions; apply your application's authentication and access controls when mounting it.
 
 For monitoring through MCP clients, use the separate [oxana-mcp crate](https://github.com/pragmaplatform/oxana/tree/main/oxana-mcp). It serves bearer-authenticated, read-only tools for queue statistics, jobs, processes, and metrics.
