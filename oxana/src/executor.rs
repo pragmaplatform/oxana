@@ -272,7 +272,11 @@ where
             for (envelope, policy) in envelopes.iter().zip(policies.iter()) {
                 let result = if terminal {
                     tracing::error!(job_id = envelope.id, "Job failed terminally: {}", err_msg);
-                    config.storage.internal.kill(envelope, err_msg.clone()).await
+                    config
+                        .storage
+                        .internal
+                        .kill(envelope, err_msg.clone())
+                        .await
                 } else {
                     handle_err(
                         config,

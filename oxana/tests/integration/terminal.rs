@@ -133,7 +133,9 @@ pub async fn test_terminal_error_found_in_source_chain_kills_job() -> TestResult
         .dequeue_timeout(Duration::from_millis(50))
         .exit_when_processed(1);
 
-    storage.enqueue(QueueOne, WorkerWrappedTerminalJob {}).await?;
+    storage
+        .enqueue(QueueOne, WorkerWrappedTerminalJob {})
+        .await?;
     runtime.run().await?;
 
     assert_eq!(storage.retries_count().await?, 0);

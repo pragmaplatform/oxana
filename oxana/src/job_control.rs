@@ -104,6 +104,9 @@ mod tests {
 
     #[test]
     fn terminal_display_is_the_reason() {
-        assert_eq!(Terminal("invalid recipient".into()).to_string(), "invalid recipient");
+        assert_eq!(
+            Terminal("invalid recipient".into()).to_string(),
+            "invalid recipient"
+        );
     }
 }
