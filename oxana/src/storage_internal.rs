@@ -797,37 +797,17 @@ impl StorageInternal {
         envelope: &JobEnvelope,
         delay: std::time::Duration,
     ) -> Result<(), OxanaError> {
-        let job_id = &envelope.id;
-        let mut redis = self.claimed_connection("snooze").await?;
-        // Re-read so state saved by the worker during this run is kept.
-        let Some(envelope) = self.get_job_w_conn(&mut redis, job_id).await? else {
-            let _: usize = redis
-                .lrem(self.current_processing_queue(), 1, job_id)
-                .await?;
-            tracing::warn!(job_id, "Job payload removed before snooze; released claim");
-            return Ok(());
-        };
-        let now = chrono::Utc::now();
         let run_at = chrono::TimeDelta::from_std(delay)
             .ok()
-            .and_then(|delay| now.checked_add_signed(delay))
+            .and_then(|delay| chrono::Utc::now().checked_add_signed(delay))
             .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
-        let updated_envelope = envelope.with_scheduled_at(run_at);
-
-        // Same transition as a retry (write payload, add to a sorted set, release
-        // the claim), but into the schedule set and without counting a retry.
-        static SNOOZE: std::sync::LazyLock<redis::Script> =
-            std::sync::LazyLock::new(|| redis::Script::new(include_str!("retry_failed.lua")));
-        let _: () = SNOOZE
-            .key(&self.keys.jobs)
-            .key(&self.keys.schedule)
-            .key(self.current_processing_queue())
-            .arg(&updated_envelope.id)
-            .arg(serde_json::to_string(&updated_envelope)?)
-            .arg(updated_envelope.meta.scheduled_at)
-            .invoke_async(&mut *redis)
-            .await?;
-        Ok(())
+        self.reschedule_claimed(&envelope.id, &self.keys.schedule, "snooze", |envelope| {
+            let mut envelope = envelope.with_scheduled_at(run_at);
+            envelope.meta.started_at = None;
+            let score = envelope.meta.scheduled_at;
+            (envelope, score)
+        })
+        .await
     }
 
     pub async fn retry_in(
@@ -836,31 +816,53 @@ impl StorageInternal {
         delay_s: u64,
         error: String,
     ) -> Result<(), OxanaError> {
-        let mut redis = self.claimed_connection("retry").await?;
-        let Some(envelope) = self.get_job_w_conn(&mut redis, &job_id).await? else {
+        let now = chrono::Utc::now().timestamp_micros();
+        let delay_us = i64::try_from(delay_s.saturating_mul(1_000_000)).unwrap_or(i64::MAX);
+        self.reschedule_claimed(&job_id, &self.keys.retry, "retry", |envelope| {
+            (
+                envelope.with_retries_incremented(error),
+                now.saturating_add(delay_us),
+            )
+        })
+        .await
+    }
+
+    /// Moves a claimed job into a sorted set (retry or schedule) with `score`,
+    /// re-reading the payload first so state saved during the run is kept.
+    async fn reschedule_claimed(
+        &self,
+        job_id: &JobId,
+        set_key: &str,
+        action: &'static str,
+        update: impl FnOnce(JobEnvelope) -> (JobEnvelope, i64),
+    ) -> Result<(), OxanaError> {
+        let mut redis = self.claimed_connection(action).await?;
+        let Some(envelope) = self.get_job_w_conn(&mut redis, job_id).await? else {
             // Dashboard deletion or retention cleanup can remove a running job.
             // Release its claim without touching a replacement payload or retry.
             // Redis errors still propagate so the runtime stops heartbeating.
             let _: usize = redis
-                .lrem(self.current_processing_queue(), 1, &job_id)
+                .lrem(self.current_processing_queue(), 1, job_id)
                 .await?;
-            tracing::warn!(job_id, "Job payload removed before retry; released claim");
+            tracing::warn!(
+                job_id,
+                action,
+                "Job payload removed before reschedule; released claim"
+            );
             return Ok(());
         };
-        let updated_envelope = envelope.with_retries_incremented(error);
+        let (updated_envelope, score) = update(envelope);
 
-        let now = chrono::Utc::now().timestamp_micros() as u64;
-
-        // Release ownership only after the payload and retry destination are durable.
-        static RETRY: std::sync::LazyLock<redis::Script> =
+        // Release ownership only after the payload and destination are durable.
+        static RESCHEDULE: std::sync::LazyLock<redis::Script> =
             std::sync::LazyLock::new(|| redis::Script::new(include_str!("retry_failed.lua")));
-        let _: () = RETRY
+        let _: () = RESCHEDULE
             .key(&self.keys.jobs)
-            .key(&self.keys.retry)
+            .key(set_key)
             .key(self.current_processing_queue())
             .arg(&updated_envelope.id)
             .arg(serde_json::to_string(&updated_envelope)?)
-            .arg(now + delay_s * 1_000_000)
+            .arg(score)
             .invoke_async(&mut *redis)
             .await?;
         Ok(())

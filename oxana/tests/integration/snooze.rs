@@ -84,6 +84,7 @@ pub async fn test_snooze_reschedules_same_job_without_spending_a_retry() -> Test
         .await?;
     assert_eq!(scheduled[0].id, id);
     assert_eq!(scheduled[0].meta.retries, 0);
+    assert_eq!(scheduled[0].meta.started_at, None);
     assert!(
         scheduled[0].meta.scheduled_at >= before + 60_000_000,
         "job should be scheduled at least 60s ahead"
@@ -95,6 +96,7 @@ pub async fn test_snooze_reschedules_same_job_without_spending_a_retry() -> Test
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WorkerShortSnoozeJob {
     pub attempts_key: String,
+    pub state_key: String,
 }
 
 pub struct WorkerShortSnooze {
@@ -122,8 +124,11 @@ impl oxana::Worker<WorkerShortSnoozeJob> for WorkerShortSnooze {
         let mut redis = self.state.redis.get().await?;
         let attempt: i64 = redis.incr(&job.attempts_key, 1).await?;
         if attempt == 1 {
+            ctx.state.update("saved before snooze").await?;
             return Err(oxana::Snooze(Duration::from_millis(500)).into());
         }
+        let saved: Option<String> = ctx.state.get().await?;
+        let _: () = redis.set(&job.state_key, saved.unwrap_or_default()).await?;
         Ok(())
     }
 
@@ -150,11 +155,13 @@ pub async fn test_snoozed_job_runs_again_after_delay() -> TestResult {
         .exit_when_processed(2);
 
     let attempts_key = uuid::Uuid::new_v4().to_string();
+    let state_key = uuid::Uuid::new_v4().to_string();
     storage
         .enqueue(
             QueueOne,
             WorkerShortSnoozeJob {
                 attempts_key: attempts_key.clone(),
+                state_key: state_key.clone(),
             },
         )
         .await?;
@@ -162,6 +169,8 @@ pub async fn test_snoozed_job_runs_again_after_delay() -> TestResult {
 
     let attempts: i64 = redis_conn.get(&attempts_key).await?;
     assert_eq!(attempts, 2);
+    let seen_state: String = redis_conn.get(&state_key).await?;
+    assert_eq!(seen_state, "saved before snooze");
     assert_eq!(storage.dead_count().await?, 0);
     assert_eq!(storage.jobs_count().await?, 0);
 

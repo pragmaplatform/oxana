@@ -141,5 +141,21 @@ pub async fn test_terminal_error_found_in_source_chain_kills_job() -> TestResult
     assert_eq!(storage.retries_count().await?, 0);
     assert_eq!(storage.dead_count().await?, 1);
 
+    let dead = storage
+        .list_dead(&oxana::QueueListOpts {
+            count: 1,
+            offset: 0,
+        })
+        .await?;
+    assert!(
+        dead[0]
+            .meta
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("server refused")),
+        "dead job should keep the wrapped terminal reason, got {:?}",
+        dead[0].meta.error
+    );
+
     Ok(())
 }
