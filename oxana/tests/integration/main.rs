@@ -11,6 +11,8 @@ mod registry;
 mod retry;
 mod shared;
 mod standard;
+mod snooze;
 mod stats;
+mod terminal;
 mod try_enqueue;
 mod unique;

@@ -165,6 +165,27 @@ On-demand argument templates infer editable placeholders from field types. Numer
 
 Batch workers use all-or-nothing result semantics: if `process_batch` returns `Ok(())`, every job in the batch is marked successful; if it returns an error or panics, every job in that batch follows the normal retry or failure path. Batch handlers should therefore be idempotent, or should only commit external side effects after the whole batch is ready to succeed.
 
+#### Ending or postponing a job from the worker
+
+Two marker errors let a worker override the retry policy for one run. Return them directly (with the default `BoxError`) or as the `source` of your own error type; Oxana checks the whole source chain.
+
+- `oxana::Terminal(reason)` sends the job straight to the dead queue on this run, whatever `max_retries` says, with the formatted error (including `reason`) stored on the job.
+- `oxana::Snooze(duration)` schedules the same job (same id, same retry count, saved state kept) to run again after `duration`, without spending a retry and without reporting a failure.
+
+```rust
+async fn process(&self, job: SendMessage, _ctx: &oxana::JobContext) -> Result<(), oxana::BoxError> {
+    if !job.recipient_is_valid() {
+        return Err(oxana::Terminal("invalid recipient".into()).into());
+    }
+    if !self.connected().await {
+        return Err(oxana::Snooze(std::time::Duration::from_secs(30)).into());
+    }
+    Ok(())
+}
+```
+
+In a batch, the marker applies to every job in that batch.
+
 ### Queues
 
 Queues are the channels through which jobs flow. Use the `#[derive(oxana::Queue)]` macro or implement the `Queue` trait manually. Static queues do not need `Serialize`; dynamic queues need serializable fields so Oxana can derive each runtime queue key.

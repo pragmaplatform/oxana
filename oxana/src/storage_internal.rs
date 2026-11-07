@@ -791,6 +791,45 @@ impl StorageInternal {
             .await
     }
 
+    /// Reschedules a claimed job after `delay` with the same id and retry count.
+    pub async fn snooze(
+        &self,
+        envelope: &JobEnvelope,
+        delay: std::time::Duration,
+    ) -> Result<(), OxanaError> {
+        let job_id = &envelope.id;
+        let mut redis = self.claimed_connection("snooze").await?;
+        // Re-read so state saved by the worker during this run is kept.
+        let Some(envelope) = self.get_job_w_conn(&mut redis, job_id).await? else {
+            let _: usize = redis
+                .lrem(self.current_processing_queue(), 1, job_id)
+                .await?;
+            tracing::warn!(job_id, "Job payload removed before snooze; released claim");
+            return Ok(());
+        };
+        let now = chrono::Utc::now();
+        let run_at = chrono::TimeDelta::from_std(delay)
+            .ok()
+            .and_then(|delay| now.checked_add_signed(delay))
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
+        let updated_envelope = envelope.with_scheduled_at(run_at);
+
+        // Same transition as a retry (write payload, add to a sorted set, release
+        // the claim), but into the schedule set and without counting a retry.
+        static SNOOZE: std::sync::LazyLock<redis::Script> =
+            std::sync::LazyLock::new(|| redis::Script::new(include_str!("retry_failed.lua")));
+        let _: () = SNOOZE
+            .key(&self.keys.jobs)
+            .key(&self.keys.schedule)
+            .key(self.current_processing_queue())
+            .arg(&updated_envelope.id)
+            .arg(serde_json::to_string(&updated_envelope)?)
+            .arg(updated_envelope.meta.scheduled_at)
+            .invoke_async(&mut *redis)
+            .await?;
+        Ok(())
+    }
+
     pub async fn retry_in(
         &self,
         job_id: JobId,
