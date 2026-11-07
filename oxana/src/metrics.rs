@@ -379,6 +379,7 @@ impl JobMetricsBuffer {
                 metrics.failed_executions = metrics.failed_executions.saturating_add(1);
                 queue_metrics.failed = queue_metrics.failed.saturating_add(result.job_count);
             }
+            WorkerResultKind::Snoozed => {}
         }
     }
 

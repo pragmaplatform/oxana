@@ -2,6 +2,7 @@ use futures::FutureExt;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use crate::job_control::{JobControl, job_control};
 use crate::job_envelope::JobEnvelope;
 use crate::job_state::JobState;
 use crate::result_collector::WorkerResultKind;
@@ -215,7 +216,30 @@ where
             WorkerResultKind::Success
         }
         ExecutionResult::Failed(e) => {
-            let failure_metadata = failure_metadata(envelopes, policies, names);
+            let control = job_control(e.as_ref());
+            if let Some(JobControl::Snooze(delay)) = control {
+                if let Some(envelope) = envelopes.first() {
+                    tracing::info!(
+                        job_id = envelope.id,
+                        queue = envelope.queue,
+                        job = names.job,
+                        worker = names.worker,
+                        batch_size = envelopes.len(),
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        "Job snoozed"
+                    );
+                }
+                for envelope in envelopes {
+                    if let Err(error) = config.storage.internal.snooze(envelope, delay).await {
+                        config.fail(error);
+                        break;
+                    }
+                }
+                return WorkerResultKind::Snoozed;
+            }
+            let terminal = control == Some(JobControl::Terminal);
+
+            let failure_metadata = failure_metadata(envelopes, policies, names, terminal);
             config.settings.report_failure(
                 WorkerFailureReport {
                     failure: WorkerFailure::Error(e.as_ref()),
@@ -246,15 +270,24 @@ where
 
             let err_msg = config.settings.format_error(e.as_ref());
             for (envelope, policy) in envelopes.iter().zip(policies.iter()) {
-                if let Err(error) = handle_err(
-                    config,
-                    &err_msg,
-                    envelope,
-                    retry_delay(config, e.as_ref(), envelope, policy),
-                    policy.max_retries,
-                )
-                .await
-                {
+                let result = if terminal {
+                    tracing::error!(job_id = envelope.id, "Job failed terminally: {}", err_msg);
+                    config
+                        .storage
+                        .internal
+                        .kill(envelope, err_msg.clone())
+                        .await
+                } else {
+                    handle_err(
+                        config,
+                        &err_msg,
+                        envelope,
+                        retry_delay(config, e.as_ref(), envelope, policy),
+                        policy.max_retries,
+                    )
+                    .await
+                };
+                if let Err(error) = result {
                     // Leave remaining claims for recovery instead of spending
                     // another connection retry window on every job in the batch.
                     config.fail(error);
@@ -265,7 +298,7 @@ where
             WorkerResultKind::Failed
         }
         ExecutionResult::Panicked(panic_msg) => {
-            let failure_metadata = failure_metadata(envelopes, policies, names);
+            let failure_metadata = failure_metadata(envelopes, policies, names, false);
             config.settings.report_failure(
                 WorkerFailureReport {
                     failure: WorkerFailure::Panic {
@@ -300,12 +333,13 @@ fn failure_metadata(
     envelopes: &[JobEnvelope],
     policies: &[JobExecutionPolicy],
     names: ExecutionNames,
+    terminal: bool,
 ) -> WorkerFailureMetadata {
     let jobs = envelopes
         .iter()
         .zip(policies)
         .map(|(envelope, policy)| {
-            let will_retry = envelope.meta.retries < policy.max_retries;
+            let will_retry = !terminal && envelope.meta.retries < policy.max_retries;
             FailedJobMetadata {
                 job_id: envelope.id.clone(),
                 args: envelope.job.args.clone(),
