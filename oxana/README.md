@@ -31,7 +31,7 @@ Use it to enqueue typed jobs, run workers with shared application state, and mon
 Requires Rust 1.89 or newer and a running Redis instance. In a new Rust binary project, add the dependencies used below:
 
 ```bash
-cargo add oxana@2.5.0 --features registry
+cargo add oxana@2.6.0 --features registry
 cargo add serde --features derive
 cargo add tokio --features macros,rt-multi-thread
 cargo add async-trait thiserror
