@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-11-24
+
 ### Added
 
 - Add `Terminal` and `Snooze` worker errors. `Terminal(reason)` moves the job to the dead queue on the current run regardless of `max_retries`; `Snooze(duration)` reschedules the same job after `duration` without incrementing its retry count or reporting a failure. Both are detected anywhere in the returned error's source chain. Other errors keep following `max_retries` and `retry_delay`.
