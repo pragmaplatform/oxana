@@ -347,15 +347,22 @@ impl JobMetricsBuffer {
 
     pub(crate) fn record(&mut self, result: &WorkerResult) {
         let minute = chrono::Utc::now().timestamp().div_euclid(60);
-        let identity = MetricIdentity::from_worker_result(result);
-        let metrics = self.entries.entry((minute, identity)).or_default();
         let queue_metrics = self
             .queue_entries
             .entry((minute, result.queue.clone()))
             .or_default();
 
-        metrics.processed = metrics.processed.saturating_add(result.job_count);
         queue_metrics.processed = queue_metrics.processed.saturating_add(result.job_count);
+
+        // Snoozes leave the queue, but are neither successes nor failures. Worker
+        // metrics derive successes from processed - failed, so omit them there.
+        if matches!(result.kind, WorkerResultKind::Snoozed) {
+            return;
+        }
+
+        let identity = MetricIdentity::from_worker_result(result);
+        let metrics = self.entries.entry((minute, identity)).or_default();
+        metrics.processed = metrics.processed.saturating_add(result.job_count);
 
         match result.kind {
             WorkerResultKind::Success => {
@@ -379,6 +386,7 @@ impl JobMetricsBuffer {
                 metrics.failed_executions = metrics.failed_executions.saturating_add(1);
                 queue_metrics.failed = queue_metrics.failed.saturating_add(result.job_count);
             }
+            WorkerResultKind::Snoozed => {}
         }
     }
 
@@ -907,6 +915,77 @@ mod tests {
         assert_eq!(counters.processed, 4);
         assert_eq!(counters.succeeded, 3);
         assert_eq!(counters.failed, 1);
+    }
+
+    #[test]
+    fn snoozed_batch_only_counts_toward_queue_metrics() {
+        let mut buffer = JobMetricsBuffer::default();
+        buffer.record(&WorkerResult {
+            kind: WorkerResultKind::Snoozed,
+            worker_name: "Worker".to_string(),
+            queue: "default".to_string(),
+            execution_ms: 100,
+            job_count: 3,
+        });
+
+        assert_eq!(buffer.records().count(), 0);
+        let (_, _, counters) = buffer.queue_records().next().expect("queue counters");
+        assert_eq!(counters.processed, 3);
+        assert_eq!(counters.succeeded, 0);
+        assert_eq!(counters.failed, 0);
+    }
+
+    #[test]
+    fn snoozed_batch_does_not_inflate_completed_worker_metrics() {
+        let mut buffer = JobMetricsBuffer::default();
+        for (kind, job_count, execution_ms) in [
+            (WorkerResultKind::Success, 2, 25),
+            (WorkerResultKind::Snoozed, 3, 100),
+            (WorkerResultKind::Failed, 1, 50),
+        ] {
+            buffer.record(&WorkerResult {
+                kind,
+                worker_name: "Worker".to_string(),
+                queue: "default".to_string(),
+                execution_ms,
+                job_count,
+            });
+        }
+
+        // Sum across buckets so crossing a minute boundary cannot affect the test.
+        let records = buffer.records().collect::<Vec<_>>();
+        assert_eq!(records.iter().map(|(_, _, m)| m.processed).sum::<u64>(), 3);
+        assert_eq!(records.iter().map(|(_, _, m)| m.failed).sum::<u64>(), 1);
+        assert_eq!(
+            records
+                .iter()
+                .map(|(_, _, m)| m.successful_executions)
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|(_, _, m)| m.failed_executions)
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            records.iter().map(|(_, _, m)| m.execution_ms).sum::<u64>(),
+            25
+        );
+        assert_eq!(
+            records
+                .iter()
+                .flat_map(|(_, _, m)| m.histogram)
+                .sum::<u64>(),
+            1
+        );
+
+        let counters = buffer.queue_records().collect::<Vec<_>>();
+        assert_eq!(counters.iter().map(|(_, _, c)| c.processed).sum::<u64>(), 6);
+        assert_eq!(counters.iter().map(|(_, _, c)| c.succeeded).sum::<u64>(), 2);
+        assert_eq!(counters.iter().map(|(_, _, c)| c.failed).sum::<u64>(), 1);
     }
 
     #[test]

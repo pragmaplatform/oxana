@@ -82,6 +82,7 @@ mod drainer;
 mod error;
 mod executor;
 mod failure;
+mod job_control;
 mod job_envelope;
 mod job_state;
 mod launcher;
@@ -117,6 +118,7 @@ pub use crate::error::OxanaError;
 pub use crate::failure::{
     FailedJobMetadata, WorkerFailure, WorkerFailureMetadata, WorkerFailureReport,
 };
+pub use crate::job_control::{Snooze, Terminal};
 pub use crate::job_envelope::{
     JobConflictStrategy, JobData, JobEnvelope, JobId, JobMeta, UniqueJobId,
 };

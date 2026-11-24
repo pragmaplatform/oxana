@@ -35,6 +35,8 @@ pub(crate) enum WorkerResultKind {
     Success,
     Panicked,
     Failed,
+    /// Postponed by the worker with `Snooze`: neither a success nor a failure.
+    Snoozed,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -60,6 +62,7 @@ impl QueueResultStats {
             WorkerResultKind::Failed => {
                 self.failed = self.failed.saturating_add(count);
             }
+            WorkerResultKind::Snoozed => {}
         }
     }
 }
@@ -140,6 +143,7 @@ where
             WorkerResultKind::Failed => {
                 stats.failed = stats.failed.saturating_add(result.job_count);
             }
+            WorkerResultKind::Snoozed => {}
         }
 
         stats.processed
