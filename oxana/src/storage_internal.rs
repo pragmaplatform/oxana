@@ -794,14 +794,14 @@ impl StorageInternal {
     /// Reschedules a claimed job after `delay` with the same id and retry count.
     pub async fn snooze(
         &self,
-        envelope: &JobEnvelope,
+        job_id: &JobId,
         delay: std::time::Duration,
     ) -> Result<(), OxanaError> {
         let run_at = chrono::TimeDelta::from_std(delay)
             .ok()
             .and_then(|delay| chrono::Utc::now().checked_add_signed(delay))
             .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
-        self.reschedule_claimed(&envelope.id, &self.keys.schedule, "snooze", |envelope| {
+        self.reschedule_claimed(job_id, &self.keys.schedule, "snooze", |envelope| {
             let mut envelope = envelope.with_scheduled_at(run_at);
             envelope.meta.started_at = None;
             let score = envelope.meta.scheduled_at;

@@ -6,19 +6,15 @@ use testresult::TestResult;
 use crate::shared::*;
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct WorkerSnoozeJob {
-    pub attempts_key: String,
-}
+pub struct WorkerSnoozeJob;
 
-pub struct WorkerSnooze {
-    state: WorkerState,
-}
+pub struct WorkerSnooze;
 
 impl oxana::Job for WorkerSnoozeJob {}
 
-impl oxana::FromContext<WorkerState> for WorkerSnooze {
-    fn from_context(ctx: &WorkerState) -> Self {
-        Self { state: ctx.clone() }
+impl oxana::FromContext<()> for WorkerSnooze {
+    fn from_context(_ctx: &()) -> Self {
+        Self
     }
 }
 
@@ -28,15 +24,10 @@ impl oxana::Worker<WorkerSnoozeJob> for WorkerSnooze {
 
     async fn process(
         &self,
-        job: WorkerSnoozeJob,
+        _job: WorkerSnoozeJob,
         _ctx: &oxana::JobContext,
     ) -> Result<(), Self::Error> {
-        let mut redis = self.state.redis.get().await?;
-        let attempt: i64 = redis.incr(&job.attempts_key, 1).await?;
-        if attempt == 1 {
-            return Err(oxana::Snooze(Duration::from_secs(60)).into());
-        }
-        Ok(())
+        Err(oxana::Snooze(Duration::from_secs(60)).into())
     }
 
     fn retry_delay(&self, _job: &WorkerSnoozeJob, _retries: u32) -> u64 {
@@ -51,25 +42,37 @@ impl oxana::Worker<WorkerSnoozeJob> for WorkerSnooze {
 #[tokio::test]
 pub async fn test_snooze_reschedules_same_job_without_spending_a_retry() -> TestResult {
     let redis_pool = setup();
-    let ctx = WorkerState {
-        redis: redis_pool.clone(),
-    };
     let storage = oxana::Storage::builder()
         .namespace(random_string())
         .build_from_pool(redis_pool)?;
     let runtime = storage
-        .runtime(ctx)
+        .runtime(())
         .queue::<QueueOne>()
         .worker::<WorkerSnooze, WorkerSnoozeJob>()
         .dequeue_timeout(Duration::from_millis(50))
         .exit_when_processed(1);
 
-    let attempts_key = uuid::Uuid::new_v4().to_string();
     let before = chrono::Utc::now().timestamp_micros();
-    let id = storage
-        .enqueue(QueueOne, WorkerSnoozeJob { attempts_key })
+    let id = storage.enqueue(QueueOne, WorkerSnoozeJob).await?;
+    let stats = runtime.run().await?;
+    assert_eq!(stats.processed, 1);
+    assert_eq!(stats.succeeded, 0);
+    assert_eq!(stats.failed, 0);
+
+    let metrics = storage
+        .job_metrics_for(
+            &oxana::MetricIdentity {
+                worker: std::any::type_name::<WorkerSnoozeJob>().to_string(),
+            },
+            oxana::JobMetricsQuery::default(),
+        )
         .await?;
-    runtime.run().await?;
+    assert_eq!(metrics.totals.processed, 0);
+    assert_eq!(metrics.totals.succeeded, 0);
+    assert_eq!(metrics.totals.successful_executions, 0);
+    assert!(metrics.series.iter().all(|point| {
+        point.processed == 0 && point.succeeded == 0 && point.successful_executions == 0
+    }));
 
     // max_retries is 0, so a counted attempt would have killed the job.
     assert_eq!(storage.dead_count().await?, 0);
@@ -165,7 +168,22 @@ pub async fn test_snoozed_job_runs_again_after_delay() -> TestResult {
             },
         )
         .await?;
-    tokio::time::timeout(Duration::from_secs(30), runtime.run()).await??;
+    let stats = tokio::time::timeout(Duration::from_secs(30), runtime.run()).await??;
+    assert_eq!(stats.processed, 2);
+    assert_eq!(stats.succeeded, 1);
+    assert_eq!(stats.failed, 0);
+
+    let metrics = storage
+        .job_metrics_for(
+            &oxana::MetricIdentity {
+                worker: std::any::type_name::<WorkerShortSnoozeJob>().to_string(),
+            },
+            oxana::JobMetricsQuery::default(),
+        )
+        .await?;
+    assert_eq!(metrics.totals.processed, 1);
+    assert_eq!(metrics.totals.succeeded, 1);
+    assert_eq!(metrics.totals.successful_executions, 1);
 
     let attempts: i64 = redis_conn.get(&attempts_key).await?;
     assert_eq!(attempts, 2);
@@ -174,5 +192,102 @@ pub async fn test_snoozed_job_runs_again_after_delay() -> TestResult {
     assert_eq!(storage.dead_count().await?, 0);
     assert_eq!(storage.jobs_count().await?, 0);
 
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DrainSnoozeJob {
+    delay_secs: u64,
+    wrapped: bool,
+}
+
+impl oxana::Job for DrainSnoozeJob {}
+
+struct DrainSnoozeWorker;
+
+impl oxana::FromContext<()> for DrainSnoozeWorker {
+    fn from_context(_ctx: &()) -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("not ready yet")]
+struct WrappedSnooze(#[source] oxana::Snooze);
+
+#[async_trait::async_trait]
+impl oxana::Worker<DrainSnoozeJob> for DrainSnoozeWorker {
+    type Error = oxana::BoxError;
+
+    async fn process(
+        &self,
+        job: DrainSnoozeJob,
+        ctx: &oxana::JobContext,
+    ) -> Result<(), Self::Error> {
+        ctx.state.update("saved before drain snooze").await?;
+        let snooze = oxana::Snooze(Duration::from_secs(job.delay_secs));
+        if job.wrapped {
+            Err(WrappedSnooze(snooze).into())
+        } else {
+            Err(snooze.into())
+        }
+    }
+
+    fn max_retries(&self, _job: &DrainSnoozeJob) -> u32 {
+        0
+    }
+}
+
+#[tokio::test]
+async fn test_drain_snooze_preserves_job_and_state() -> TestResult {
+    for (delay_secs, wrapped) in [(60, false), (60, true), (0, true)] {
+        let storage = oxana::Storage::builder()
+            .namespace(random_string())
+            .build_from_pool(setup())?;
+        let before = chrono::Utc::now().timestamp_micros();
+        let id = storage
+            .enqueue(
+                QueueOne,
+                DrainSnoozeJob {
+                    delay_secs,
+                    wrapped,
+                },
+            )
+            .await?;
+        let runtime = storage
+            .runtime(())
+            .queue::<QueueOne>()
+            .worker::<DrainSnoozeWorker, DrainSnoozeJob>();
+        let stats = tokio::time::timeout(Duration::from_secs(5), runtime.drain(QueueOne)).await??;
+
+        assert_eq!(stats.processed, 1);
+        assert_eq!(stats.succeeded, 0);
+        assert_eq!(stats.failed, 0);
+        assert_eq!(stats.missing, 0);
+        assert_eq!(storage.scheduled_count().await?, 1);
+        assert_eq!(storage.dead_count().await?, 0);
+        assert_eq!(storage.retries_count().await?, 0);
+        assert_eq!(
+            runtime.drain(QueueOne).await?.processed,
+            0,
+            "queue should be empty"
+        );
+
+        let scheduled = storage
+            .list_scheduled(&oxana::QueueListOpts {
+                count: 1,
+                offset: 0,
+            })
+            .await?;
+        let job = &scheduled[0];
+        assert_eq!(job.id, id);
+        assert_eq!(job.meta.retries, 0);
+        assert_eq!(job.meta.started_at, None);
+        assert_eq!(
+            job.meta.state,
+            Some(serde_json::json!("saved before drain snooze"))
+        );
+        assert!(job.meta.scheduled_at >= before + i64::try_from(delay_secs)? * 1_000_000);
+    }
     Ok(())
 }

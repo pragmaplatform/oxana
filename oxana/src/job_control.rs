@@ -10,32 +10,18 @@ use std::time::Duration;
 /// [`BoxError`](crate::BoxError)) or wrap it as the
 /// [`source`](std::error::Error::source) of your own error type: Oxana looks
 /// for it anywhere in the error's source chain.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
 pub struct Terminal(pub String);
-
-impl std::fmt::Display for Terminal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Terminal {}
 
 /// Worker error that postpones a job without spending a retry.
 ///
 /// The same job (same id, same retry count, current state) is scheduled to
 /// run again after the given duration. Like [`Terminal`], it may be returned
 /// directly or found anywhere in the error's source chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("job snoozed for {0:?}")]
 pub struct Snooze(pub Duration);
-
-impl std::fmt::Display for Snooze {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "job snoozed for {:?}", self.0)
-    }
-}
-
-impl std::error::Error for Snooze {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JobControl {
@@ -62,20 +48,9 @@ pub(crate) fn job_control(error: &(dyn std::error::Error + 'static)) -> Option<J
 mod tests {
     use super::*;
 
-    #[derive(Debug)]
-    struct Wrapper(Box<dyn std::error::Error + Send + Sync>);
-
-    impl std::fmt::Display for Wrapper {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("wrapper")
-        }
-    }
-
-    impl std::error::Error for Wrapper {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            Some(self.0.as_ref())
-        }
-    }
+    #[derive(Debug, thiserror::Error)]
+    #[error("wrapper")]
+    struct Wrapper(#[source] Box<dyn std::error::Error + Send + Sync>);
 
     #[test]
     fn plain_errors_have_no_control() {

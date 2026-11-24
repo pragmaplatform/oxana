@@ -3,6 +3,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{Config, RuntimeSettings};
 use crate::context::ContextValue;
 use crate::error::OxanaError;
+use crate::job_control::{JobControl, job_control};
 use crate::job_state::JobState;
 use crate::{JobContext, JobId, Queue, Storage};
 
@@ -10,6 +11,7 @@ enum ProcessJobResult {
     Success,
     Failed,
     Missing,
+    Snoozed,
 }
 
 #[derive(Default, Debug)]
@@ -109,6 +111,7 @@ where
             ProcessJobResult::Success => stats.succeeded += 1,
             ProcessJobResult::Failed => stats.failed += 1,
             ProcessJobResult::Missing => stats.missing += 1,
+            ProcessJobResult::Snoozed => {}
         }
         stats.processed += 1;
     }
@@ -154,6 +157,15 @@ where
             Ok(ProcessJobResult::Success)
         }
         Err(e) => {
+            if let Some(JobControl::Snooze(delay)) = job_control(e.as_ref()) {
+                storage.internal.snooze(&envelope.id, delay).await?;
+                tracing::info!(
+                    job_id = envelope.id,
+                    delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                    "Job snoozed"
+                );
+                return Ok(ProcessJobResult::Snoozed);
+            }
             tracing::error!("Job failed: {}", e);
             storage
                 .internal

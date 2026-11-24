@@ -230,7 +230,7 @@ where
                     );
                 }
                 for envelope in envelopes {
-                    if let Err(error) = config.storage.internal.snooze(envelope, delay).await {
+                    if let Err(error) = config.storage.internal.snooze(&envelope.id, delay).await {
                         config.fail(error);
                         break;
                     }

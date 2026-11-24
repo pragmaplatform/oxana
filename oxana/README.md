@@ -186,6 +186,14 @@ async fn process(&self, job: SendMessage, _ctx: &oxana::JobContext) -> Result<()
 
 In a batch, the marker applies to every job in that batch.
 
+Snoozes count toward runtime and queue `processed` totals, but not toward `succeeded`, `failed`, or completed-worker metrics. Consequently, queue `processed` can exceed `succeeded + failed`. `drain()` also reschedules snoozed jobs and counts them only in `DrainStats::processed`; it does not run scheduled jobs, even when the snooze duration is zero.
+
+The runnable [Terminal and Snooze example](https://github.com/pragmaplatform/oxana/blob/main/oxana/examples/terminal_and_snooze.rs) demonstrates a permanent failure and a one-second snooze that preserves saved state and the retry count:
+
+```sh
+REDIS_URL=redis://127.0.0.1:6379 cargo run -p oxana --example terminal_and_snooze
+```
+
 ### Queues
 
 Queues are the channels through which jobs flow. Use the `#[derive(oxana::Queue)]` macro or implement the `Queue` trait manually. Static queues do not need `Serialize`; dynamic queues need serializable fields so Oxana can derive each runtime queue key.
